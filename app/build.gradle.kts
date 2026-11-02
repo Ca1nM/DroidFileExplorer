@@ -45,9 +45,9 @@ android {
     signingConfigs {
         create("release") {
             storeFile = file("${rootProject.rootDir}/keys/release.keystore")
-            storePassword = "SerZhyA25"
+            storePassword = "REMOVED-PASSWORD"
             keyAlias = "AndroidFolderExplorer"
-            keyPassword = "SerZhyA25"
+            keyPassword = "REMOVED-PASSWORD"
         }
     }
 
@@ -81,6 +81,16 @@ android {
 
     buildFeatures {
         compose = true
+    }
+
+    packaging {
+        resources {
+            excludes += setOf(
+                "META-INF/DEPENDENCIES", "META-INF/LICENSE*", "META-INF/NOTICE*",
+                "META-INF/versions/9/OSGI-INF/MANIFEST.MF", "META-INF/*.SF", "META-INF/*.DSA", "META-INF/*.RSA",
+                "META-INF/BCKEY.DSA", "META-INF/BCKEY.SF"
+            )
+        }
     }
 }
 
@@ -121,4 +131,32 @@ dependencies {
     // Shizuku — privileged shell access for Android/data on API 34+
     implementation(libs.shizuku.api)
     implementation(libs.shizuku.provider)
+
+    // Archive extraction: zip/7z/tar via commons-compress; xz needed for LZMA2 (7z) and .tar.xz
+    implementation(libs.commons.compress)
+    implementation(libs.xz)
+
+    // Media: video/audio player with background playback (Media3 / ExoPlayer)
+    implementation(libs.media3.exoplayer)
+    implementation(libs.media3.ui)
+    implementation(libs.media3.session)
+
+    // Photos: EXIF read/strip/date edit
+    implementation(libs.exifinterface)
+    // Vault unlock
+    implementation(libs.biometric)
+    // Scheduled folder sync and auto-sort rules
+    implementation(libs.work.runtime)
+    // Fold posture (tabletop / book) and hinge position
+    implementation(libs.window)
+    // Password-protected zip create/extract and integrity test
+    implementation(libs.zip4j)
+    // Network storage: SFTP, FTP, SMB, WebDAV
+    implementation(libs.jsch)
+    implementation(libs.commons.net)
+    implementation(libs.smbj)
+    implementation(libs.okhttp)
+    // LAN file server and its QR code
+    implementation(libs.nanohttpd)
+    implementation(libs.zxing.core)
 }

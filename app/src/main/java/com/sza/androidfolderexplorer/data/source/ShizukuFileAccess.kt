@@ -55,14 +55,18 @@ class ShizukuFileAccess @Inject constructor(
     }
 
     fun listDirectory(path: String): List<FileItem> {
-        // stat -c format: fullpath|type|size|modified_unix_seconds
+        // `-exec ... {} +` hands every entry to one stat process. The old `{} \;` started a separate
+        // process per entry, which cost about 0.9 s for a folder with 100 entries.
+        val started = System.nanoTime()
         val output = runShell(
-            "find ${q(path)} -maxdepth 1 -mindepth 1 -exec stat -c '%n|%F|%s|%Y' {} \\; 2>/dev/null"
+            "find ${q(path)} -maxdepth 1 -mindepth 1 -exec stat -c '%F|%s|%Y|%n' {} + 2>/dev/null"
         )
-        return output.lines()
+        val items = output.lines()
             .filter { it.isNotBlank() }
             .mapNotNull { parseStat(it) }
             .sortedWith(compareBy<FileItem> { !it.isDirectory }.thenBy { it.name.lowercase() })
+        Log.d(STAG, "listDirectory ${items.size} entries in ${(System.nanoTime() - started) / 1_000_000} ms: $path")
+        return items
     }
 
     fun calculateTotalSize(paths: List<String>): Long =
@@ -89,13 +93,54 @@ class ShizukuFileAccess @Inject constructor(
     fun deleteRecursively(path: String): Boolean =
         runShellWithExit("rm -rf ${q(path)}") == 0
 
+    fun rename(from: String, to: String): Boolean = runShellWithExit("mv ${q(from)} ${q(to)}") == 0
+    fun mkdirs(path: String): Boolean = runShellWithExit("mkdir -p ${q(path)}") == 0
+    fun createFile(path: String): Boolean = runShellWithExit("touch ${q(path)}") == 0
+    fun exists(path: String): Boolean = runShellWithExit("test -e ${q(path)}") == 0
+    fun isDirectory(path: String): Boolean = runShellWithExit("test -d ${q(path)}") == 0
+
+    /** Sets the modification time; [millis] since epoch. */
+    fun setModified(path: String, millis: Long): Boolean {
+        val stamp = java.text.SimpleDateFormat("yyyyMMddHHmm.ss", java.util.Locale.US).format(java.util.Date(millis))
+        return runShellWithExit("touch -m -t $stamp ${q(path)}") == 0
+    }
+
+    fun symlink(target: String, link: String): Boolean = runShellWithExit("ln -s ${q(target)} ${q(link)}") == 0
+
+    /** Streams a file's bytes through `cat`. The caller closes the stream. */
+    @Suppress("DEPRECATION")
+    fun openInputStream(path: String): java.io.InputStream =
+        Shizuku.newProcess(arrayOf("sh", "-c", "cat ${q(path)}"), null, null).inputStream
+
+    /** Writes [data] into [path] through `cat >`. */
+    @Suppress("DEPRECATION")
+    fun write(path: String, data: java.io.InputStream): Boolean = try {
+        val p = Shizuku.newProcess(arrayOf("sh", "-c", "cat > ${q(path)}"), null, null)
+        p.outputStream.use { out -> data.copyTo(out) }
+        p.waitFor() == 0
+    } catch (e: Exception) {
+        Log.e(STAG, "write failed", e); false
+    }
+
+    /** Runs an arbitrary command in [cwd] and returns exit code and combined output. */
+    @Suppress("DEPRECATION")
+    fun exec(command: String, cwd: String? = null): Pair<Int, String> = try {
+        val full = if (cwd != null) "cd ${q(cwd)} && $command" else command
+        val process = Shizuku.newProcess(arrayOf("sh", "-c", "$full 2>&1"), null, null)
+        val out = process.inputStream.bufferedReader().readText()
+        process.waitFor() to out
+    } catch (e: Exception) {
+        -1 to (e.message ?: "Shizuku error")
+    }
+
     private fun parseStat(line: String): FileItem? {
-        val parts = line.split("|")
+        // Format: type|size|modified_unix_seconds|fullpath. The path is last so a '|' in a name can't split it.
+        val parts = line.split("|", limit = 4)
         if (parts.size < 4) return null
-        val fullPath = parts[0].trim()
-        val type = parts[1].trim()
-        val size = parts[2].trim().toLongOrNull() ?: 0L
-        val modifiedSec = parts[3].trim().toLongOrNull() ?: 0L
+        val type = parts[0].trim()
+        val size = parts[1].trim().toLongOrNull() ?: 0L
+        val modifiedSec = parts[2].trim().toLongOrNull() ?: 0L
+        val fullPath = parts[3]
         val name = fullPath.substringAfterLast('/')
         if (name.isEmpty()) return null
         val isDir = type == "directory"

@@ -9,10 +9,30 @@
     kotlinx.serialization.KSerializer serializer(...);
 }
 
--keep,includedescriptorclasses class com.afex.explorer.**$$serializer { *; }
--keepclassmembers class com.afex.explorer.** {
+-keep,includedescriptorclasses class com.sza.androidfolderexplorer.**$$serializer { *; }
+-keepclassmembers class com.sza.androidfolderexplorer.** {
     *** Companion;
 }
--keepclasseswithmembers class com.afex.explorer.** {
+-keepclasseswithmembers class com.sza.androidfolderexplorer.** {
     kotlinx.serialization.KSerializer serializer(...);
 }
+
+# Network / server libraries reference desktop-only classes
+-dontwarn org.slf4j.**
+-dontwarn org.bouncycastle.**
+-dontwarn javax.naming.**
+-dontwarn org.ietf.jgss.**
+-dontwarn com.sun.jna.**
+-dontwarn org.newsclub.**
+-dontwarn org.apache.logging.**
+-dontwarn org.conscrypt.**
+-dontwarn org.openjsse.**
+-dontwarn javax.el.**
+-dontwarn net.engio.mbassy.**
+-dontwarn com.jcraft.jsch.**
+-keep class com.jcraft.jsch.** { *; }
+-keep class com.hierynomus.** { *; }
+-keep class org.bouncycastle.** { *; }
+-keep class net.engio.mbassy.** { *; }
+-dontwarn org.apache.commons.compress.**
+-dontwarn org.tukaani.**

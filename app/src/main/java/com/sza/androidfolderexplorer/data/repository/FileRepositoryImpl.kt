@@ -39,12 +39,20 @@ class FileRepositoryImpl @Inject constructor(
             Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE &&
             Environment.isExternalStorageManager()
 
-    override suspend fun listDirectory(path: String): Result<List<FileItem>> =
+    override suspend fun listDirectory(path: String, countChildren: Boolean): Result<List<FileItem>> =
         withContext(Dispatchers.IO) {
             runCatching {
                 when {
+                    // Device root browsing (/, /system, /data/local/tmp ...): File API first,
+                    // then the Shizuku shell, which can read much more of the system tree.
+                    !path.startsWith("/storage/") -> {
+                        val viaFile = runCatching { dataSource.listDirectory(path, countChildren) }.getOrNull()
+                        viaFile?.takeIf { it.isNotEmpty() || !shizukuFileAccess.hasPermission() }
+                            ?: if (shizukuFileAccess.hasPermission()) shizukuFileAccess.listDirectory(path)
+                            else throw SecurityException("Cannot read $path. Start Shizuku to browse system folders.")
+                    }
                     !safFileAccess.isRestrictedPath(path) -> {
-                        val items = dataSource.listDirectory(path)
+                        val items = dataSource.listDirectory(path, countChildren)
                         // Android 11+ FUSE hides data/ and obb/ from File.listFiles() when
                         // listing the Android/ parent — inject them manually if missing.
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -60,7 +68,7 @@ class FileRepositoryImpl @Inject constructor(
                     // Some Samsung/custom ROMs still block it — catch and fall back to error
                     hasManageStorageAccess() -> {
                         try {
-                            dataSource.listDirectory(path)
+                            dataSource.listDirectory(path, countChildren)
                         } catch (_: SecurityException) {
                             throw RestrictedAccessException(path)
                         }

@@ -9,7 +9,8 @@ import javax.inject.Singleton
 @Singleton
 class LocalFileDataSource @Inject constructor() {
 
-    fun listDirectory(path: String): List<FileItem> {
+    /** [countChildren] = false skips a second directory read per subfolder; callers that never show counts pass it. */
+    fun listDirectory(path: String, countChildren: Boolean = true): List<FileItem> {
         val dir = File(path)
         val files = dir.listFiles()
             ?: throw SecurityException("Cannot access directory: $path. Check storage permissions.")
@@ -21,7 +22,7 @@ class LocalFileDataSource @Inject constructor() {
                 isDirectory = file.isDirectory,
                 size = if (file.isFile) file.length() else 0L,
                 lastModified = file.lastModified(),
-                childCount = if (file.isDirectory) file.listFiles()?.size else null
+                childCount = if (countChildren && file.isDirectory) file.listFiles()?.size else null
             )
         }.sortedWith(compareBy<FileItem> { !it.isDirectory }.thenBy { it.name.lowercase() })
     }
