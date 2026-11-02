@@ -37,6 +37,10 @@ import com.sza.androidfolderexplorer.data.FileKind
 import com.sza.androidfolderexplorer.data.FileTypes
 import com.sza.androidfolderexplorer.data.formatSize
 import com.sza.androidfolderexplorer.domain.model.FileItem
+import androidx.compose.foundation.border
+import com.sza.androidfolderexplorer.data.settings.ThumbOptions
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -57,6 +61,29 @@ object Thumbs {
     private val gate = Semaphore(3)
 
     fun supports(name: String) = FileTypes.kindOf(name).let { it == FileKind.IMAGE || it == FileKind.VIDEO || it == FileKind.APK }
+
+    /** Formats that can hold an animation; everything else is shown as a still. */
+    fun mayAnimate(name: String) = FileTypes.ext(name).trimEnd('_') in setOf("gif", "webp", "avif")
+
+    /**
+     * The file as a playing [android.graphics.drawable.AnimatedImageDrawable] scaled down to about [px], or null when it
+     * isn't animated (or is too big to animate in a list), in which case the still thumbnail is used.
+     */
+    suspend fun loadAnimated(item: FileItem, px: Int, maxMb: Int): android.graphics.drawable.Drawable? = gate.withPermit {
+        withContext(Dispatchers.IO) {
+            runCatching {
+                // maxMb 0 = "No limit" in Settings.
+                if (maxMb > 0 && File(item.path).length() > maxMb.toLong() * 1024 * 1024) return@runCatching null
+                ImageDecoder.decodeDrawable(ImageDecoder.createSource(File(item.path))) { dec, info, _ ->
+                    val big = maxOf(info.size.width, info.size.height)
+                    if (big > px) {
+                        val f = px.toFloat() / big
+                        dec.setTargetSize((info.size.width * f).toInt().coerceAtLeast(1), (info.size.height * f).toInt().coerceAtLeast(1))
+                    }
+                }.takeIf { it is android.graphics.drawable.AnimatedImageDrawable }
+            }.getOrNull()
+        }
+    }
 
     suspend fun load(context: Context, item: FileItem, px: Int): Bitmap? {
         val key = "${item.path}|${item.lastModified}|$px"
@@ -95,9 +122,92 @@ object Thumbs {
 fun FileThumb(item: FileItem, px: Int, modifier: Modifier, enabled: Boolean, fallback: @Composable () -> Unit) {
     if (!enabled || item.isDirectory || !Thumbs.supports(item.name)) { fallback(); return }
     val context = LocalContext.current
+    // Settings > Browser > "Animate GIF thumbnails": on/off, loop or play once, and the biggest file that will animate.
+    val animate = ThumbOptions.animate
+    val loop = ThumbOptions.loop
+    val maxMb = ThumbOptions.maxMb
+    if (animate && Thumbs.mayAnimate(item.name)) {
+        // GIFs and animated WebP play inside the tile while it is on screen; the still shows until the animation is ready.
+        val anim by produceState<android.graphics.drawable.Drawable?>(null, item.path, item.lastModified, maxMb) { value = Thumbs.loadAnimated(item, px, maxMb) }
+        val d = anim
+        if (d != null) {
+            // Drawn straight onto the tile's canvas: the drawable tells us when its next frame is ready (invalidateDrawable)
+            // and we redraw then, so it can't stall the way a wrapped ImageView did, and it loops forever.
+            var frame by androidx.compose.runtime.remember(d) { androidx.compose.runtime.mutableIntStateOf(0) }
+            androidx.compose.runtime.DisposableEffect(d, loop) {
+                val a = d as android.graphics.drawable.AnimatedImageDrawable
+                val handler = android.os.Handler(android.os.Looper.getMainLooper())
+                a.callback = object : android.graphics.drawable.Drawable.Callback {
+                    override fun invalidateDrawable(who: android.graphics.drawable.Drawable) { frame++ }
+                    override fun scheduleDrawable(who: android.graphics.drawable.Drawable, what: Runnable, `when`: Long) { handler.postAtTime(what, who, `when`) }
+                    override fun unscheduleDrawable(who: android.graphics.drawable.Drawable, what: Runnable) { handler.removeCallbacks(what, who) }
+                }
+                // Loop on: repeat forever. Loop off: one play, then it rests on the last frame.
+                a.repeatCount = if (loop) android.graphics.drawable.AnimatedImageDrawable.REPEAT_INFINITE else 0
+                a.registerAnimationCallback(object : android.graphics.drawable.Animatable2.AnimationCallback() {
+                    override fun onAnimationEnd(drawable: android.graphics.drawable.Drawable?) { if (loop) a.start() }   // some files report one play
+                })
+                a.start()
+                onDispose {
+                    a.stop(); a.clearAnimationCallbacks(); a.callback = null
+                    handler.removeCallbacksAndMessages(a)
+                }
+            }
+            // Watchdog: if the drawable ever stops for any reason (end of a run, a paused window ...), start it again.
+            androidx.compose.runtime.LaunchedEffect(d, loop) {
+                val a = d as android.graphics.drawable.AnimatedImageDrawable
+                while (true) {
+                    kotlinx.coroutines.delay(250)
+                    if (loop && !a.isRunning) a.start()
+                    // The drawable only moves to its next frame when it is drawn; if its own redraw request is ever missed the
+                    // tile would freeze, so also ask for a redraw on every tick (drawing early is harmless).
+                    if (loop || a.isRunning) frame++
+                }
+            }
+            androidx.compose.foundation.Canvas(modifier) {
+                frame   // read so each new animation frame redraws this tile
+                val dw = d.intrinsicWidth.coerceAtLeast(1); val dh = d.intrinsicHeight.coerceAtLeast(1)
+                val scale = maxOf(size.width / dw, size.height / dh)          // fill the tile, cropping the overflow
+                drawIntoCanvas { c ->
+                    val n = c.nativeCanvas
+                    n.save()
+                    n.clipRect(0f, 0f, size.width, size.height)
+                    n.translate((size.width - dw * scale) / 2f, (size.height - dh * scale) / 2f)
+                    n.scale(scale, scale)
+                    d.setBounds(0, 0, dw, dh)
+                    d.draw(n)
+                    n.restore()
+                }
+            }
+            return
+        }
+    }
     val bmp by produceState<Bitmap?>(null, item.path, item.lastModified) { value = Thumbs.load(context, item, px) }
     val b = bmp
     if (b != null) Image(b.asImageBitmap(), null, modifier, contentScale = ContentScale.Crop) else fallback()
+}
+
+/**
+ * The square tile at the start of a file row in the secondary lists (Trash, Storage overview, Duplicate finder):
+ * always [size] wide with the same rounded corners and tint, showing the preview when there is one and the file's
+ * icon centred otherwise, so every row lines up no matter what the file is. Previews decode at 256 px.
+ */
+@Composable
+fun FileTile(item: FileItem, size: androidx.compose.ui.unit.Dp = 36.dp, modifier: Modifier = Modifier) {
+    androidx.compose.foundation.layout.Box(
+        modifier
+            .size(size)
+            .clip(RoundedCornerShape(10.dp))
+            .background(MaterialTheme.colorScheme.primaryContainer),
+        contentAlignment = androidx.compose.ui.Alignment.Center
+    ) {
+        FileThumb(item, 256, Modifier.fillMaxSize(), true) {
+            androidx.compose.material3.Icon(
+                if (item.isDirectory) androidx.compose.material.icons.Icons.Default.Folder else fileIconFor(item.name), null,
+                Modifier.size(20.dp), tint = MaterialTheme.colorScheme.primary
+            )
+        }
+    }
 }
 
 // ---- Fast scrollbar with bubble ----

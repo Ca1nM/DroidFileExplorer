@@ -61,7 +61,27 @@ object ArchiveTools {
     }
 
     fun isEncryptedZip(archive: File): Boolean =
-        archive.name.endsWith(".zip", true) && runCatching { ZipFile(archive).isEncrypted }.getOrDefault(false)
+        archive.name.endsWith(".zip", true) && (
+            // A direct read of the zip directory is far faster than any library; the libraries stay as fallbacks.
+            ZipDirectory.read(archive)?.any { it.encrypted } ?: runCatching {
+                org.apache.commons.compress.archivers.zip.ZipFile.builder().setFile(archive).get().use { z ->
+                    val entries = z.entries
+                    var found = false
+                    while (!found && entries.hasMoreElements()) found = entries.nextElement().generalPurposeBit.usesEncryption()
+                    found
+                }
+            }.getOrElse { runCatching { ZipFile(archive).isEncrypted }.getOrDefault(false) }
+        )
+
+    /** The entries of a zip via commons-compress (fast, no password needed to list), or null if it can't read it. */
+    private fun fastZipList(archive: File): List<ArchiveEntryInfo>? =
+        ZipDirectory.read(archive)?.map { ArchiveEntryInfo(it.name.trimEnd('/'), it.isDirectory, it.size) } ?: slowZipList(archive)
+
+    private fun slowZipList(archive: File): List<ArchiveEntryInfo>? = runCatching {
+        org.apache.commons.compress.archivers.zip.ZipFile.builder().setFile(archive).get().use { z ->
+            java.util.Collections.list(z.entries).map { ArchiveEntryInfo(it.name.trimEnd('/'), it.isDirectory, maxOf(it.size, 0L)) }
+        }
+    }.getOrNull()
 
     /** True for a password-protected zip or RAR. */
     fun isEncrypted(archive: File): Boolean =
@@ -79,17 +99,18 @@ object ArchiveTools {
         }
         else extractZipWithPassword(archive, destDir, password)
 
-    /** Lists every entry. Works for zip, 7z, RAR and tar variants; ISO is not supported here. */
+    /** Lists every entry. Works for zip, 7z, RAR, tar variants and ISO 9660 images. */
     suspend fun list(archive: File, password: String? = null): List<ArchiveEntryInfo> = withContext(Dispatchers.IO) {
         val lower = archive.name.lowercase()
         when {
             RarSupport.handles(archive.name) -> RarSupport.list(archive, password)
-            lower.endsWith(".zip") -> zip(archive, password).fileHeaders.map {
+            lower.endsWith(".zip") -> fastZipList(archive) ?: zip(archive, password).fileHeaders.map {
                 ArchiveEntryInfo(it.fileName.trimEnd('/'), it.isDirectory, it.uncompressedSize)
             }
             lower.endsWith(".7z") -> SevenZFile.builder().setFile(archive).get().use { sz ->
                 sz.entries.map { ArchiveEntryInfo(it.name.trimEnd('/'), it.isDirectory, it.size) }
             }
+            ArchiveExtractor.isDiscImageName(lower) -> ArchiveExtractor.listIso(archive)
             else -> {
                 val out = mutableListOf<ArchiveEntryInfo>()
                 tarStream(archive)?.use { s ->
@@ -112,6 +133,7 @@ object ArchiveTools {
             if (!e.path.startsWith(prefix) || e.path == folder) continue
             val rest = e.path.removePrefix(prefix)
             val first = rest.substringBefore('/')
+            if (first.isEmpty() || first == ".." || first == ".") continue    // never shown: extraction skips these paths anyway
             val isDir = rest.contains('/') || e.isDirectory
             val key = prefix + first
             val prev = seen[key]
@@ -127,17 +149,24 @@ object ArchiveTools {
         destDir: File,
         password: String? = null,
         onProgress: (done: Long, total: Long) -> Unit = { _, _ -> }
-    ): Int =
-        if (RarSupport.handles(archive.name)) withContext(Dispatchers.IO) {
+    ): Int {
+        if (RarSupport.handles(archive.name)) return withContext(Dispatchers.IO) {
             val fast = if (archive.name.endsWith(".7z", true) && password == null) {
                 ArchiveExtractor.tryParallelSevenZ(archive, destDir, paths, {}, onProgress)
             } else null
             fast ?: RarSupport.extract(archive, destDir, password, null, {}, onProgress, onlyPaths = paths)
-        } else {
-            var n = 0
-            for (p in paths) n += extractEntry(archive, p, destDir, password)
-            n
         }
+        if (archive.name.endsWith(".zip", true) && password == null && !isEncryptedZip(archive)) {
+            // One multi-core pass over the zip, however many files were picked.
+            val n = withContext(Dispatchers.IO) { ParallelZip.extract(archive, destDir, paths, onProgress, {}, always = true) }
+            if (n != null) return n
+        }
+        // Tar variants: a single pass over the archive instead of one pass per file.
+        ArchiveExtractor.extractOnly(archive, destDir, paths, onProgress)?.let { return it }
+        var n = 0
+        for (p in paths) n += extractEntry(archive, p, destDir, password)
+        return n
+    }
 
     /** Extracts one entry (a file, or a folder with everything under it) into [destDir]. */
     suspend fun extractEntry(archive: File, entryPath: String, destDir: File, password: String? = null): Int =
@@ -153,6 +182,8 @@ object ArchiveTools {
             }
             when {
                 RarSupport.handles(archive.name) -> count = RarSupport.extract(archive, destDir, password, entryPath)
+                ArchiveExtractor.isDiscImageName(lower) ->
+                    count = ArchiveExtractor.extractIsoWhere(archive, destDir, { it == entryPath || it.startsWith("$entryPath/") }, {})
                 lower.endsWith(".zip") -> {
                     val z = zip(archive, password)
                     for (h in z.fileHeaders.filter { matches(it.fileName) }) {
@@ -214,6 +245,10 @@ object ArchiveTools {
         try {
             when {
                 RarSupport.handles(archive.name) -> entries = RarSupport.test(archive, password, onProgress)
+                ArchiveExtractor.isDiscImageName(lower) -> {
+                    val n = ArchiveExtractor.listIso(archive).count { !it.isDirectory }
+                    return@withContext TestResult(true, "OK: the image's folder structure is readable ($n file(s)). ISO files carry no checksums to verify.")
+                }
                 lower.endsWith(".zip") -> {
                     val z = zip(archive, password)
                     if (!z.isValidZipFile) return@withContext TestResult(false, "Not a valid zip file")

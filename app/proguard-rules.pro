@@ -36,3 +36,8 @@
 -keep class net.engio.mbassy.** { *; }
 -dontwarn org.apache.commons.compress.**
 -dontwarn org.tukaani.**
+
+# 7-Zip-JBinding (RAR and 7z): its native code finds these classes and their callback methods by name,
+# so minification must not rename or strip them. Small library; the app's own RarSupport implements its callbacks.
+-keep class net.sf.sevenzipjbinding.** { *; }
+-dontwarn net.sf.sevenzipjbinding.**

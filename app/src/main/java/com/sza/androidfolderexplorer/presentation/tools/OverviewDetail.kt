@@ -86,14 +86,13 @@ internal fun FilesDetailPage(category: String, vm: ToolsViewModel, onReveal: () 
                     verticalAlignment = Alignment.CenterVertically
                 ) {
                     Checkbox(f.path in selected, onCheckedChange = null, modifier = Modifier.padding(8.dp))
-                    FileThumb(f, 96, Modifier.size(44.dp).clip(RoundedCornerShape(8.dp)), true) {
-                        Icon(Icons.Default.InsertDriveFile, null, Modifier.size(44.dp).padding(10.dp), tint = MaterialTheme.colorScheme.primary)
-                    }
+                    com.sza.androidfolderexplorer.presentation.browser.FileTile(f)
                     Spacer(Modifier.width(10.dp))
                     Column(Modifier.weight(1f)) {
                         Text(f.name, maxLines = 2, overflow = TextOverflow.Ellipsis)
                         Text(
-                            f.path.removePrefix(STORAGE_ROOT).substringBeforeLast('/').ifEmpty { "/" } + " · " +
+                            (com.sza.androidfolderexplorer.presentation.browser.typeLabelOf(f.name)?.plus(" · ") ?: "") +
+                                f.path.removePrefix(STORAGE_ROOT).substringBeforeLast('/').ifEmpty { "/" } + " · " +
                                 DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(f.lastModified)),
                             maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant

@@ -33,6 +33,7 @@ import androidx.lifecycle.viewModelScope
 import com.sza.androidfolderexplorer.data.FileKind
 import com.sza.androidfolderexplorer.data.FileTypes
 import com.sza.androidfolderexplorer.data.SecretBox
+import com.sza.androidfolderexplorer.domain.model.FileItem
 import com.sza.androidfolderexplorer.presentation.browser.SharedClipboard
 import com.sza.androidfolderexplorer.data.network.CloudNames
 import com.sza.androidfolderexplorer.data.network.NetworkRequests
@@ -115,6 +116,8 @@ class NetworkViewModel @Inject constructor(
     }
 
     private val downloadDir get() = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "Network")
+    /** Where saved downloads, and archives extracted from a server file, go. */
+    val downloadFolder: String get() = downloadDir.absolutePath
 
     /** Runs blocking work (network, disk) off the main thread. */
     private suspend fun <T> io(f: () -> T): T = withContext(Dispatchers.IO) { f() }
@@ -222,6 +225,24 @@ class NetworkViewModel @Inject constructor(
         message = "Saved to Download/Network/${target.name}"
     }
 
+    /**
+     * Fetches [item] into a temporary cache copy (not your Downloads) and hands it to [onReady] to be opened. Each open
+     * replaces the previous copy, so the cache never fills up.
+     */
+    fun open(item: RemoteItem, onReady: (File) -> Unit) = launch("Opening ${item.name}") {
+        val c = client ?: return@launch
+        val file = io {
+            val root = File(context.cacheDir, "remote_open")
+            root.deleteRecursively()
+            val dir = File(root, System.nanoTime().toString()).also { it.mkdirs() }
+            val t = File(dir, item.name.replace(Regex("[\\\\/:*?\"<>|]"), "_").ifBlank { "file" })
+            try { t.outputStream().buffered().use { c.download(item, it) } }
+            catch (e: Throwable) { t.delete(); throw e }
+            t
+        }
+        onReady(file)
+    }
+
     fun upload(uris: List<Uri>) = launch("Uploading") {
         val c = client ?: return@launch
         var n = 0
@@ -307,6 +328,10 @@ private val Protocols = listOf(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun NetworkScreen(onBack: () -> Unit, viewModel: NetworkViewModel = hiltViewModel()) {
+    // Opens files you tap here in the app's own viewers, editor and archive view, on top of this screen.
+    val files: com.sza.androidfolderexplorer.presentation.browser.FileBrowserViewModel = hiltViewModel()
+    val fileState by files.uiState.collectAsStateWithLifecycle()
+    com.sza.androidfolderexplorer.presentation.browser.FileOverlays(fileState, files)
     val user by viewModel.userData.state.collectAsStateWithLifecycle()
     val context = LocalContext()
     val snack = remember { SnackbarHostState() }
@@ -317,6 +342,10 @@ fun NetworkScreen(onBack: () -> Unit, viewModel: NetworkViewModel = hiltViewMode
     var showPickHelp by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf<RemoteItem?>(null) }
     var menuFor by remember { mutableStateOf<RemoteItem?>(null) }
+    // Messages from the file viewers opened on top of this screen (for example "Extracted 12 file(s) to …").
+    LaunchedEffect(fileState.snackbar?.id) {
+        fileState.snackbar?.let { snack.showSnackbar(it.text); files.dismissSnackbar() }
+    }
     LaunchedEffect(viewModel.message) {
         viewModel.message?.let {
             val file = viewModel.lastDownload
@@ -335,7 +364,7 @@ fun NetworkScreen(onBack: () -> Unit, viewModel: NetworkViewModel = hiltViewMode
     BackHandler(enabled = connected) { if (!viewModel.up()) viewModel.disconnect() }
 
     Scaffold(
-        snackbarHost = { SnackbarHost(snack) },
+        snackbarHost = { com.sza.androidfolderexplorer.ui.theme.AppSnackbarHost(snack) },
         topBar = {
             TopAppBar(
                 title = { Text(if (connected) viewModel.active!!.name else "Network & cloud", maxLines = 1, overflow = TextOverflow.Ellipsis) },
@@ -424,7 +453,13 @@ fun NetworkScreen(onBack: () -> Unit, viewModel: NetworkViewModel = hiltViewMode
                                 },
                                 leadingContent = { Icon(remoteIcon(it), null, tint = MaterialTheme.colorScheme.primary) },
                                 trailingContent = { IconButton(onClick = { menuFor = it }) { Icon(Icons.Default.MoreVert, "Actions for ${it.name}") } },
-                                modifier = Modifier.clickable { if (it.isDirectory) viewModel.openFolder(it) else viewModel.download(it) }
+                                // A tap opens the file (in the app's own viewers); Download in the menu saves a copy.
+                                modifier = Modifier.clickable {
+                                    if (it.isDirectory) viewModel.openFolder(it)
+                                    else viewModel.open(it) { f ->
+                                        files.openTemporary(FileItem(f.name, f.absolutePath, false, f.length(), f.lastModified()), viewModel.downloadFolder)
+                                    }
+                                }
                             )
                             DropdownMenu(menuFor == it, { menuFor = null }) {
                                 if (!it.isDirectory) DropdownMenuItem(text = { Text("Download") }, leadingIcon = { Icon(Icons.Default.Download, null) }, onClick = { menuFor = null; viewModel.download(it) })
@@ -475,23 +510,12 @@ private fun remoteIcon(item: RemoteItem): androidx.compose.ui.graphics.vector.Im
     return when {
         mime.startsWith("application/vnd.google-apps.spreadsheet") -> Icons.Default.TableChart
         mime.startsWith("application/vnd.google-apps") -> Icons.Default.Description
-        else -> when (FileTypes.kindOf(item.name)) {
-            FileKind.IMAGE -> Icons.Default.Image
-            FileKind.VIDEO -> Icons.Default.Movie
-            FileKind.AUDIO -> Icons.Default.MusicNote
-            FileKind.PDF -> Icons.Default.PictureAsPdf
-            FileKind.ARCHIVE -> Icons.Default.Archive
-            FileKind.APK -> Icons.Default.Android
-            FileKind.TEXT, FileKind.MARKDOWN, FileKind.LOG -> Icons.Default.Description
-            FileKind.JSON, FileKind.XML -> Icons.Default.Code
-            FileKind.CSV -> Icons.Default.TableChart
-            else -> when {
-                mime.startsWith("image/") -> Icons.Default.Image
-                mime.startsWith("video/") -> Icons.Default.Movie
-                mime.startsWith("audio/") -> Icons.Default.MusicNote
-                else -> Icons.Default.InsertDriveFile
-            }
-        }
+        // Same icon set as the main browser; the MIME type only decides when the name has no known extension.
+        FileTypes.ext(item.name).isNotEmpty() -> com.sza.androidfolderexplorer.presentation.browser.fileIconFor(item.name)
+        mime.startsWith("image/") -> Icons.Default.Image
+        mime.startsWith("video/") -> Icons.Default.Movie
+        mime.startsWith("audio/") -> Icons.Default.MusicNote
+        else -> com.sza.androidfolderexplorer.presentation.browser.fileIconFor(item.name)
     }
 }
 

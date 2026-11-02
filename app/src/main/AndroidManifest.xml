@@ -55,10 +55,29 @@
         <activity
             android:name=".MainActivity"
             android:exported="true"
+            android:launchMode="singleTask"
             android:theme="@style/Theme.FolderExplorer">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- "Open with" for any file: other apps (a browser's downloads, DebForge ...) can hand files to this app -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+
+            <!-- ...and for folders, the way file managers are asked to show one -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="resource/folder" />
+                <data android:mimeType="vnd.android.document/directory" />
+                <data android:mimeType="inode/directory" />
             </intent-filter>
         </activity>
 
@@ -66,6 +85,7 @@
         <activity
             android:name=".presentation.viewer.PlayerActivity"
             android:exported="true"
+            android:label="Folder Explorer – Player"
             android:supportsPictureInPicture="true"
             android:resizeableActivity="true"
             android:launchMode="singleTask"
@@ -85,6 +105,7 @@
         <activity
             android:name=".presentation.install.InstallActivity"
             android:exported="true"
+            android:label="Folder Explorer – Installer"
             android:theme="@style/Theme.FolderExplorer">
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
@@ -98,11 +119,14 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:scheme="content" />
                 <data android:scheme="file" />
+                <!-- Android only applies a pathPattern when a host is declared; "*" is the usual way to say "any".
+                     Without it this filter matched every zip and octet-stream file, not just split-APK bundles. -->
+                <data android:host="*" />
                 <data android:mimeType="application/octet-stream" />
                 <data android:mimeType="application/zip" />
-                <data android:pathPattern=".*\.xapk" />
-                <data android:pathPattern=".*\.apks" />
-                <data android:pathPattern=".*\.apkm" />
+                <data android:pathPattern=".*\\.xapk" />
+                <data android:pathPattern=".*\\.apks" />
+                <data android:pathPattern=".*\\.apkm" />
             </intent-filter>
         </activity>
 

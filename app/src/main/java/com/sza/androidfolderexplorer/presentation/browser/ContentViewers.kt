@@ -77,6 +77,8 @@ private fun readLimited(vm: FileBrowserViewModel, path: String, max: Int = MAX_V
 @Composable
 fun ContentViewerDialog(path: String, kind: FileKindHint, vm: FileBrowserViewModel, onClose: () -> Unit) {
     var rawToggle by remember { mutableStateOf(false) }
+    // A temporary copy (a file taken out of an archive) can't be edited: the changes would be lost with the copy.
+    val temporary = path.startsWith(androidx.compose.ui.platform.LocalContext.current.cacheDir.path)
     Dialog(onDismissRequest = onClose, properties = DialogProperties(usePlatformDefaultWidth = false)) {
         Surface(Modifier.fillMaxSize()) {
             Scaffold(topBar = {
@@ -87,7 +89,7 @@ fun ContentViewerDialog(path: String, kind: FileKindHint, vm: FileBrowserViewMod
                         if (kind == FileKindHint.MARKDOWN) {
                             TextButton(onClick = { rawToggle = !rawToggle }) { Text(if (rawToggle) "Rendered" else "Raw") }
                         }
-                        if (kind in listOf(FileKindHint.MARKDOWN, FileKindHint.JSON, FileKindHint.XML, FileKindHint.CSV, FileKindHint.LOG)) {
+                        if (!temporary && kind in listOf(FileKindHint.MARKDOWN, FileKindHint.JSON, FileKindHint.XML, FileKindHint.CSV, FileKindHint.LOG)) {
                             IconButton(onClick = { onClose(); vm.openEditor(path) }) { Icon(Icons.Default.Edit, "Edit as text") }
                         }
                     }
@@ -95,12 +97,12 @@ fun ContentViewerDialog(path: String, kind: FileKindHint, vm: FileBrowserViewMod
             }) { padding ->
                 Box(Modifier.padding(padding).fillMaxSize()) {
                     when (kind) {
-                        FileKindHint.MARKDOWN -> TextLoader(vm, path) { if (rawToggle) RawText(it) else MarkdownView(it) }
+                        FileKindHint.MARKDOWN -> TextLoader(vm, path) { if (rawToggle) RawText(it, java.io.File(path).name) else MarkdownView(it) }
                         FileKindHint.JSON -> TextLoader(vm, path) { JsonView(it) }
                         FileKindHint.XML -> TextLoader(vm, path) { XmlView(it) }
                         FileKindHint.CSV -> TextLoader(vm, path) { CsvView(it) }
                         FileKindHint.LOG -> LogView(path, vm)
-                        FileKindHint.TEXT -> TextLoader(vm, path) { RawText(it) }
+                        FileKindHint.TEXT -> TextLoader(vm, path) { RawText(it, java.io.File(path).name) }
                         FileKindHint.HEX -> HexView(path, vm)
                         FileKindHint.PDF -> PdfView(path)
                         FileKindHint.EXIF -> ExifView(path, vm)
@@ -134,11 +136,11 @@ private fun TextLoader(vm: FileBrowserViewModel, path: String, content: @Composa
 }
 
 @Composable
-private fun RawText(text: String) {
-    SelectionContainer {
-        Text(text, Modifier.fillMaxSize().verticalScroll(rememberScrollState()).horizontalScroll(rememberScrollState()).padding(12.dp),
-            fontFamily = FontFamily.Monospace, fontSize = 13.sp)
-    }
+private fun RawText(text: String, fileName: String? = null) {
+    // Native text widget: a single Compose Text of a few megabytes freezes the app, this stays responsive.
+    // A very long line can't scroll smoothly on one row, so those files are shown wrapped.
+    val wrap = remember(text) { com.sza.androidfolderexplorer.data.TextFiles.longestLine(text) > com.sza.androidfolderexplorer.data.TextFiles.LONG_LINE_CHARS }
+    NativeTextArea(text = text, editable = false, wrap = wrap, modifier = Modifier.fillMaxSize(), fileName = fileName)
 }
 
 // ---- Markdown ----

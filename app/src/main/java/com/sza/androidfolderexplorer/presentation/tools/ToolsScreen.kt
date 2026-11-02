@@ -417,7 +417,7 @@ fun ToolsScreen(
     }
 
     Scaffold(
-        snackbarHost = { SnackbarHost(snack) },
+        snackbarHost = { com.sza.androidfolderexplorer.ui.theme.AppSnackbarHost(snack) },
         topBar = {
             TopAppBar(
                 title = { Text(when (page) {
@@ -502,9 +502,7 @@ private fun DuplicatesPage(vm: ToolsViewModel) {
                 items(g, key = { it.path }) { f ->
                     Row(Modifier.fillMaxWidth().clickable { marked = if (f.path in marked) marked - f.path else marked + f.path }, verticalAlignment = Alignment.CenterVertically) {
                         Checkbox(f.path in marked, { marked = if (it) marked + f.path else marked - f.path })
-                        com.sza.androidfolderexplorer.presentation.browser.FileThumb(f, 96, Modifier.size(44.dp).clip(RoundedCornerShape(8.dp)), true) {
-                            Icon(Icons.Default.InsertDriveFile, null, Modifier.size(44.dp).padding(8.dp))
-                        }
+                        com.sza.androidfolderexplorer.presentation.browser.FileTile(f)
                         Spacer(Modifier.width(8.dp))
                         Column(Modifier.weight(1f)) {
                             Text(f.path.removePrefix(ROOT), maxLines = 2, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall)

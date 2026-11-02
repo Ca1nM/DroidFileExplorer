@@ -5,6 +5,7 @@ import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import androidx.activity.compose.BackHandler
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Storage
 import com.sza.androidfolderexplorer.data.settings.NetworkConnection
@@ -63,6 +64,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
+import androidx.compose.ui.draw.drawBehind
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.draw.clip
@@ -106,6 +108,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.animation.animateContentSize
+import androidx.compose.foundation.gestures.stopScroll
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -137,6 +141,7 @@ import androidx.compose.material.icons.filled.RemoveDone
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.SheetValue
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.foundation.clickable
@@ -246,6 +251,16 @@ fun FileBrowserScreen(
             prompt is AccessPromptState.ManageStorageRequired) {
             viewModel.retryPendingPath()
         }
+        // Back from the player or another app: land on the file that was opened, like backing out of a folder does.
+        viewModel.highlightLastOpened()
+    }
+
+    // Closing a viewer, editor, archive or document view also lands on the file that was opened: scroll to it and highlight it.
+    val overlayOpen = state.dialog != null || state.editorPath != null || state.viewerPaths != null || state.archiveView != null
+    var overlayWasOpen by remember { mutableStateOf(false) }
+    LaunchedEffect(overlayOpen) {
+        if (overlayWasOpen && !overlayOpen) viewModel.highlightLastOpened()
+        overlayWasOpen = overlayOpen
     }
 
     // Back clears the selection first, then goes up one folder. At the top level it opens the menu
@@ -253,7 +268,7 @@ fun FileBrowserScreen(
     // open, Back closes it (the sheet handles that itself).
     BackHandler(
         enabled = state.editorPath == null && !state.showQuickAccess && state.dialog == null &&
-            state.viewerPaths == null && !state.showOnboarding && !state.pendingDelete
+            state.viewerPaths == null && !state.showOnboarding && !state.pendingDelete && state.archiveView == null
     ) {
         when {
             state.hasSelection -> viewModel.clearSelection()
@@ -270,7 +285,7 @@ fun FileBrowserScreen(
     // Hardware keyboard (Samsung DeX, Bluetooth keyboards, desktop mode).
     val onKey: (KeyEvent) -> Boolean = handler@{ e ->
         if (e.type != KeyEventType.KeyDown) return@handler false
-        if (state.dialog != null || state.editorPath != null || state.viewerPaths != null || state.showOnboarding || state.showQuickAccess) return@handler false
+        if (state.dialog != null || state.editorPath != null || state.viewerPaths != null || state.showOnboarding || state.showQuickAccess || state.archiveView != null) return@handler false
         if (state.searchOpen) {
             return@handler if (e.key == Key.Escape) { viewModel.toggleSearch(); true } else false
         }
@@ -297,7 +312,7 @@ fun FileBrowserScreen(
 
     Scaffold(
         modifier = Modifier.focusRequester(focusRequester).focusable().onPreviewKeyEvent(onKey),
-        snackbarHost = { SnackbarHost(snackbarHost) },
+        snackbarHost = { com.sza.androidfolderexplorer.ui.theme.AppSnackbarHost(snackbarHost) },
         topBar = {
             TopAppBar(
                 title = {
@@ -352,6 +367,7 @@ fun FileBrowserScreen(
                     BottomActionBar(
                         moreMenu = { m -> SelectionMoreMenu(selectedItems, viewModel, m) },
                         selectedCount = state.selectedPaths.size,
+                        selectedName = selectedItems.singleOrNull()?.name,
                         singleFile = state.items.firstOrNull { it.path in state.selectedPaths }
                             ?.takeIf { state.selectedPaths.size == 1 && !it.isDirectory },
                         onCopy = { viewModel.stageSelection(isMove = false) },
@@ -468,11 +484,11 @@ fun FileBrowserScreen(
                             ) {
                                 gridItems(state.items, key = { it.path }) { item ->
                                     val hl by androidx.compose.animation.animateColorAsState(
-                                        if (item.path == state.highlightPath) MaterialTheme.colorScheme.secondaryContainer
+                                        if (item.path == state.highlightPath) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
                                         else androidx.compose.ui.graphics.Color.Transparent,
                                         animationSpec = androidx.compose.animation.core.tween(600), label = "highlight"
                                     )
-                                    Box(Modifier.background(hl, RoundedCornerShape(12.dp))) {
+                                    Box(Modifier.highlightBand(hl, 4.dp, 4.dp)) { // same inset and corners as a selected tile
                                         GridTile(
                                             item = item,
                                             isSelected = item.path in state.selectedPaths,
@@ -500,11 +516,11 @@ fun FileBrowserScreen(
                             ) {
                                 items(state.items, key = { it.path }) { item ->
                                     val hl by androidx.compose.animation.animateColorAsState(
-                                        if (item.path == state.highlightPath) MaterialTheme.colorScheme.secondaryContainer
+                                        if (item.path == state.highlightPath) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f)
                                         else androidx.compose.ui.graphics.Color.Transparent,
                                         animationSpec = androidx.compose.animation.core.tween(600), label = "highlight"
                                     )
-                                    Box(Modifier.background(hl)) {
+                                    Box(Modifier.highlightBand(hl, 8.dp, 3.dp)) { // same inset and corners as a selected row
                                         FileItemRow(
                                             item = item,
                                             isSelected = item.path in state.selectedPaths,
@@ -584,21 +600,7 @@ fun FileBrowserScreen(
         )
     }
 
-    state.editorPath?.let { path ->
-        TextEditorDialog(path = path, onClose = { viewModel.closeEditor() })
-    }
-
-    state.viewerPaths?.let { paths ->
-        ImageViewerDialog(
-            paths = paths,
-            startIndex = state.viewerIndex,
-            onClose = { viewModel.closeViewer() },
-            onInfo = { viewModel.showDialog(BrowserDialog.Viewer(it, FileKindHint.EXIF)) },
-            onShare = { viewModel.sharePath(it) }
-        )
-    }
-
-    state.dialog?.let { BrowserDialogHost(it, state, viewModel) }
+    FileOverlays(state, viewModel)
 
     if (state.showOnboarding) OnboardingDialog(onDone = { viewModel.finishOnboarding() })
 
@@ -625,7 +627,8 @@ fun FileBrowserScreen(
                 Button(
                     onClick = { viewModel.confirmDelete() },
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.error
+                        containerColor = Color(0xFFE5251B),
+                        contentColor = Color.White
                     )
                 ) { Text("Delete") }
             },
@@ -806,7 +809,8 @@ internal fun FileItemRow(
             dateText
         ).joinToString(" · ")
     } else {
-        listOfNotNull(formatFileSize(item.size), dateText).joinToString(" · ")
+        // The file type comes first so it is readable even when a long name is shortened above.
+        listOfNotNull(typeLabelOf(item.name), formatFileSize(item.size), dateText).joinToString(" · ")
     } + if (tags.isNotEmpty()) "  " + tags.joinToString(" ") { "#$it" } else ""
 
     val visual = remember(item.name, item.isDirectory) { visualFor(item) }
@@ -834,7 +838,7 @@ internal fun FileItemRow(
                 }
             }
             .background(
-                if (isSelected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent
+                if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f) else Color.Transparent
             )
             .combinedClickable(
                 onClickLabel = if (item.isDirectory) "Open folder" else "Open",
@@ -861,7 +865,7 @@ internal fun FileItemRow(
                 ),
             contentAlignment = Alignment.Center
         ) {
-            FileThumb(item, px = 96, modifier = Modifier.fillMaxSize(), enabled = showThumbnails) {
+            FileThumb(item, px = 256, modifier = Modifier.fillMaxSize(), enabled = showThumbnails) {
                 Icon(
                     imageVector = visual.icon,
                     contentDescription = null,
@@ -872,12 +876,12 @@ internal fun FileItemRow(
         }
         Spacer(Modifier.width(12.dp))
         Column(modifier = Modifier.weight(1f)) {
-            Text(
+            // Cut from the middle so the end of the name, with its extension, always stays visible.
+            MiddleEllipsisText(
                 item.name,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                style = MaterialTheme.typography.bodyLarge,
-                fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal
+                style = MaterialTheme.typography.bodyLarge.copy(
+                    fontWeight = if (isSelected) FontWeight.SemiBold else FontWeight.Normal
+                )
             )
             Text(
                 supporting,
@@ -902,6 +906,57 @@ internal fun FileItemRow(
     }
 }
 
+/**
+ * Paints the "you just came back from here" band with the same geometry as a selected row or tile:
+ * inset by [insetX]/[insetY] and rounded with 12 dp corners.
+ */
+/**
+ * Everything that opens on top of a screen when a file is opened: the text editor, the image viewer, the other viewers and
+ * dialogs, and an archive opened like a folder. Shared so any screen that opens files (the browser, the cloud/server
+ * screen) shows them the same way.
+ */
+@Composable
+internal fun FileOverlays(state: FileBrowserUiState, viewModel: FileBrowserViewModel) {
+    state.editorPath?.let { path ->
+        TextEditorDialog(path = path, onClose = { viewModel.closeEditor() })
+    }
+
+    state.viewerPaths?.let { paths ->
+        ImageViewerDialog(
+            paths = paths,
+            startIndex = state.viewerIndex,
+            onClose = { viewModel.closeViewer() },
+            onInfo = { viewModel.showDialog(BrowserDialog.Viewer(it, FileKindHint.EXIF)) },
+            onShare = { viewModel.sharePath(it) }
+        )
+    }
+
+    state.dialog?.let { BrowserDialogHost(it, state, viewModel) }
+
+    // An archive opened like a folder (full screen, with the extract options at the top).
+    state.archiveView?.let { ArchiveFolderView(it, viewModel) }
+}
+
+/** "Mario Kart 8 [US].NSP" -> "nsp"; null when the name has no usable extension. Compound ".tar.gz" reads "tar.gz". */
+internal fun typeLabelOf(name: String): String? {
+    val lower = name.lowercase()
+    for (c in listOf(".tar.gz", ".tar.bz2", ".tar.xz")) if (lower.endsWith(c)) return c.drop(1)
+    val ext = name.substringAfterLast('.', "")
+    return ext.takeIf { it.isNotEmpty() && it.length <= 8 && ' ' !in it }?.lowercase()
+}
+
+private fun Modifier.highlightBand(color: Color, insetX: androidx.compose.ui.unit.Dp, insetY: androidx.compose.ui.unit.Dp): Modifier =
+    drawBehind {
+        val x = insetX.toPx()
+        val y = insetY.toPx()
+        drawRoundRect(
+            color = color,
+            topLeft = androidx.compose.ui.geometry.Offset(x, y),
+            size = androidx.compose.ui.geometry.Size(size.width - 2 * x, size.height - 2 * y),
+            cornerRadius = androidx.compose.ui.geometry.CornerRadius(12.dp.toPx())
+        )
+    }
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun GridTile(
@@ -917,7 +972,7 @@ private fun GridTile(
         Modifier
             .padding(4.dp)
             .clip(RoundedCornerShape(12.dp))
-            .background(if (isSelected) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent)
+            .background(if (isSelected) MaterialTheme.colorScheme.primary.copy(alpha = 0.22f) else Color.Transparent)
             .combinedClickable(onClick = onTap, onLongClick = onLongPress)
             .padding(6.dp),
         horizontalAlignment = Alignment.CenterHorizontally
@@ -930,7 +985,7 @@ private fun GridTile(
                 .background(MaterialTheme.colorScheme.primaryContainer),
             contentAlignment = Alignment.Center
         ) {
-            FileThumb(item, px = 256, modifier = Modifier.fillMaxSize(), enabled = showThumbnails) {
+            FileThumb(item, px = 512, modifier = Modifier.fillMaxSize(), enabled = showThumbnails) {
                 Icon(visual.icon, null, Modifier.size(40.dp), tint = MaterialTheme.colorScheme.primary)
             }
             if (starred) Icon(
@@ -941,6 +996,19 @@ private fun GridTile(
                 Icons.Default.CheckCircle, null, Modifier.align(Alignment.BottomEnd).padding(4.dp).size(22.dp),
                 tint = MaterialTheme.colorScheme.primary
             )
+            // File type badge, so the type is readable even when the name below is cut short.
+            typeLabelOf(item.name)?.takeIf { !item.isDirectory }?.let { label ->
+                Text(
+                    label,
+                    Modifier.align(Alignment.BottomStart).padding(4.dp)
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.85f))
+                        .padding(horizontal = 5.dp, vertical = 1.dp),
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1
+                )
+            }
         }
         Text(
             item.name, maxLines = 2, overflow = TextOverflow.Ellipsis, textAlign = TextAlign.Center,
@@ -958,23 +1026,111 @@ private val VideoExtensions = setOf("mp4", "mkv", "mov", "avi", "webm", "3gp", "
 private val AudioExtensions = setOf("mp3", "m4a", "flac", "wav", "ogg", "aac", "opus")
 private val SheetExtensions = setOf("xls", "xlsx", "ods", "csv")
 private val DocExtensions = setOf("doc", "docx", "odt", "rtf", "txt", "md", "ppt", "pptx")
-private val ArchiveExtensions = setOf("zip", "rar", "7z", "tar", "gz", "bz2", "xz")
+private val ArchiveExtensions = setOf("zip", "rar", "7z", "tar", "gz", "bz2", "xz", "iso", "tgz", "tbz", "tbz2", "txz")
 private val CodeExtensions = setOf("kt", "java", "py", "js", "ts", "html", "css", "json", "xml", "sh", "gradle")
 
-private fun visualFor(item: FileItem): FileVisual {
-    if (item.isDirectory) return FileVisual(folderIconFor(item.name), Tone.Folder)
-    val ext = item.name.substringAfterLast('.', "").lowercase()
-    return when {
-        ext in ImageExtensions -> FileVisual(Icons.Default.Image, Tone.Media)
-        ext in VideoExtensions -> FileVisual(Icons.Default.Movie, Tone.Media)
-        ext in AudioExtensions -> FileVisual(Icons.Default.MusicNote, Tone.Audio)
-        ext == "pdf" -> FileVisual(Icons.Default.PictureAsPdf, Tone.Document)
-        ext in SheetExtensions -> FileVisual(Icons.Default.TableChart, Tone.Document)
-        ext in DocExtensions -> FileVisual(Icons.Default.Description, Tone.Document)
-        ext in ArchiveExtensions -> FileVisual(Icons.Default.Archive, Tone.Other)
-        ext == "apk" -> FileVisual(Icons.Default.Android, Tone.Other)
-        ext in CodeExtensions -> FileVisual(Icons.Default.Code, Tone.Other)
-        else -> FileVisual(Icons.AutoMirrored.Filled.InsertDriveFile, Tone.Other)
+private fun visualFor(item: FileItem): FileVisual = visualOf(item.name, item.isDirectory)
+
+/** The Material icon for a file name; shared with the network/Drive browser so both show the same range. */
+internal fun fileIconFor(name: String): ImageVector = visualOf(name, false).icon
+
+private fun visualOf(name: String, isDirectory: Boolean): FileVisual {
+    if (isDirectory) return FileVisual(folderIconFor(name), Tone.Folder)
+    // "photo.png_" and "x.dll.old" style leftovers show the icon of the real type.
+    val ext = name.substringAfterLast('.', "").lowercase().trimEnd('_').let { e ->
+        if (e == "old" || e == "bak" || e == "disabled") name.substringBeforeLast('.').substringAfterLast('.', "").lowercase().ifEmpty { e } else e
+    }
+    val F = androidx.compose.material.icons.Icons.Filled
+    fun v(icon: ImageVector, tone: Tone = Tone.Other) = FileVisual(icon, tone)
+    return when (ext) {
+        "gif", "apng" -> v(F.Animation, Tone.Media)
+        "svg", "ai", "eps", "psd", "xcf", "sketch", "fig" -> v(F.Brush, Tone.Media)
+        "raw", "dng", "cr2", "nef", "arw" -> v(F.PhotoCamera, Tone.Media)
+        "ico", "icns" -> v(F.Image, Tone.Media)
+        "mkv", "mp4", "mov", "avi", "webm", "3gp", "m4v", "wmv", "flv", "mpg", "mpeg" -> v(F.Movie, Tone.Media)
+        "flac", "wav", "alac", "aiff" -> v(F.GraphicEq, Tone.Audio)
+        "mid", "midi" -> v(F.Piano, Tone.Audio)
+        "m3u", "m3u8", "pls" -> v(F.QueueMusic, Tone.Audio)
+        "mp3", "m4a", "ogg", "aac", "opus", "wma", "amr" -> v(F.MusicNote, Tone.Audio)
+        "srt", "vtt", "ass", "ssa", "sub" -> v(F.Subtitles, Tone.Media)
+        "pdf" -> v(F.PictureAsPdf, Tone.Document)
+        "xls", "xlsx", "xlsm", "xlt", "xltx", "ods", "ots" -> v(F.GridOn, Tone.Document)
+        "csv", "tsv" -> v(F.TableChart, Tone.Document)
+        "ppt", "pptx", "pptm", "pps", "ppsx", "odp", "otp", "key" -> v(F.Slideshow, Tone.Document)
+        "doc", "docx", "docm", "dot", "dotx", "odt", "ott", "rtf", "pages" -> v(F.Article, Tone.Document)
+        "epub", "mobi", "azw3", "djvu" -> v(F.MenuBook, Tone.Document)
+        "cbz", "cbr" -> v(F.AutoStories, Tone.Document)
+        "txt", "nfo", "rst" -> v(F.TextSnippet, Tone.Document)
+        "md", "markdown" -> v(F.Notes, Tone.Document)
+        "log" -> v(F.ReceiptLong, Tone.Document)
+        "tex" -> v(F.Functions, Tone.Document)
+        "ttf", "otf", "ttc", "woff", "woff2" -> v(F.TextFields, Tone.Document)
+        "vcf" -> v(F.ContactPage, Tone.Document)
+        "ics" -> v(F.CalendarMonth, Tone.Document)
+        "eml", "msg", "mbox" -> v(F.Email, Tone.Document)
+        "iso", "img", "cue", "nrg", "rvz", "wbfs", "mdf", "dol", "gcm", "wad", "nsp", "xci", "nsz", "cso_iso" -> v(F.Album)
+        "bin", "firmware", "fw", "rom", "elf", "o", "a", "obj_bin" -> v(F.Memory)
+        "zip", "7z", "rar", "tar", "gz", "bz2", "xz", "tgz", "tbz", "tbz2", "txz", "cab", "zst", "lz4" -> v(F.FolderZip)
+        "jar", "war", "aar" -> v(F.Coffee)   // Java archives
+        "apk", "apks", "xapk", "apkm", "aab" -> v(F.Android)
+        "exe" -> v(F.Window)
+        "msi" -> v(F.InstallDesktop)
+        "com", "scr" -> v(F.DesktopWindows)
+        "bat", "cmd" -> v(F.Terminal)                       // command prompt
+        "ps1", "psm1", "psd1" -> v(F.SettingsApplications)  // PowerShell
+        "vbs", "wsf", "ahk", "au3" -> v(F.Keyboard)         // Windows automation scripts
+        "dll", "so", "dylib", "ko" -> v(F.Extension)
+        "deb", "rpm", "pkg", "dmg", "appimage", "snap" -> v(F.Inventory2)
+        "sh", "bash", "zsh", "fish", "ksh", "csh" -> v(F.Dvr)   // Unix shell scripts
+        "db", "sqlite", "sqlite3", "db3", "mdb", "realm" -> v(F.Storage)
+        "sql" -> v(F.Dataset)
+        "json", "json5", "jsonc", "ndjson", "jsonl", "geojson" -> v(F.DataObject)
+        "xml", "xsd", "xsl", "xslt", "plist", "rss", "atom" -> v(F.DataArray)
+        "yml", "yaml", "toml", "ini", "cfg", "conf", "config", "properties", "env", "prefs", "rc", "cnf" -> v(F.Settings)
+        // A browser window reads as "web page" at a glance; the Material Html icon is just tiny letters.
+        "html", "htm", "xhtml", "mhtml", "shtml" -> v(F.Web)
+        "css", "scss", "sass", "less" -> v(F.Palette)   // styles: a paint palette, not the letters "CSS"
+        "js", "jsx", "mjs", "cjs", "ts", "tsx" -> v(F.Bolt)
+        "php" -> v(F.Dns)   // server-side script
+        "kt", "kts", "java", "py", "c", "h", "cpp", "cc", "hpp", "rs", "go", "rb", "swift", "cs", "lua", "dart", "scala", "gradle", "smali", "pl", "r", "vue", "m" -> v(F.Code)
+        "diff", "patch" -> v(F.Difference)
+        "pem", "crt", "cer", "csr", "pub", "pfx", "p12", "gpg", "asc" -> v(F.VerifiedUser)
+        "key", "kdbx", "keystore", "jks" -> v(F.Key)
+        "gpx", "kml", "kmz" -> v(F.Map)
+        "stl", "obj", "fbx", "blend", "gltf", "glb", "3mf", "step", "stp" -> v(F.ViewInAr)
+        "dwg", "dxf" -> v(F.Architecture)
+        "torrent", "nzb" -> v(F.CloudDownload)
+        "lnk", "url", "desktop", "webloc" -> v(F.Link)
+        "bak", "old", "orig" -> v(F.Backup)
+        "tmp", "temp", "part", "crdownload", "pending" -> v(F.HourglassEmpty)
+        "lock" -> v(F.Lock)
+        "ovpn", "wg" -> v(F.VpnKey)
+        "sav", "save", "rkg", "vdf", "acf", "kva", "kvb", "kvc", "gamenative", "mcmeta", "sharcb" -> v(F.SportsEsports)
+        "dat", "data", "pb", "mca", "index", "cnt", "res", "meta", "info", "state", "preload", "ctl", "layout", "lang", "map", "tpl", "menu", "styles", "ver", "uid", "local", "rel", "jexl" -> v(F.FilePresent)
+        "szs", "sarc", "pak", "arc", "bars", "barslist", "baatarc", "brsar", "bfsar", "bsa", "ba2", "pck", "vpk", "unity3d", "assets" -> v(F.Archive)
+        "bntx", "tga", "tgv", "dds", "tex", "ktx", "pvr", "bnr", "astc", "exr", "hdr" -> v(F.Texture, Tone.Media)
+        "bfstm", "brstm", "bnk", "wem", "fsb", "bwav", "bcstm", "adx", "hca", "mp2", "ape", "wv", "oga" -> v(F.Audiotrack, Tone.Audio)
+        "thp", "bik", "bk2", "usm", "ogv", "mxf", "ts", "vob" -> v(F.VideoLibrary, Tone.Media)
+        "bfres", "brres", "kcl", "mdl", "mdx", "smd", "dae", "ply", "bgenv", "ptcl", "bnsh_model", "mesh" -> v(F.Category)
+        "glsl", "fsh", "vsh", "hlsl", "frag", "vert", "shader", "cso", "fxo", "bnsh", "hls", "flt", "wgsl", "spv" -> v(F.Gradient)
+        "byaml", "msbt", "msbs", "msbp", "bslnk", "bagst", "baglmf", "bfsha", "bnvib", "dmsv", "gctr", "tmd", "fmdata", "lewidget", "cbk", "appdash", "rpo", "asi", "kvb2" -> v(F.Tune)
+        "crypt", "crypt5", "crypt7", "crypt8", "crypt12", "crypt14", "crypt15", "enc", "aes", "locked" -> v(F.EnhancedEncryption)
+        "dmp", "crash", "clog", "mdmp", "stackdump", "core", "trace" -> v(F.BugReport)
+        "class", "dex", "odex", "vdex", "art", "oat" -> v(F.Build)   // compiled code
+        "ldb", "db-wal", "db-shm", "db-journal", "sqlite-wal", "sqlite-shm", "journal", "wal", "idb" -> v(F.RestorePage)   // database journals, not the database itself
+        "nomedia", "nomap", "hidden", "trashed" -> v(F.VisibilityOff)
+        "md5", "sha1", "sha256", "sha512", "sig", "signatures", "sfv", "checksum" -> v(F.Fingerprint)
+        "jwt", "token", "keys", "license", "lic" -> v(F.Badge)
+        "sys", "driver", "inf", "cat", "asi_plugin", "vxd" -> v(F.DeveloperBoard)   // drivers
+        "uifont", "fon", "pfb", "eot" -> v(F.TextFields, Tone.Document)
+        "vrmanifest", "restore", "disabled", "jwk" -> v(F.ToggleOn)
+        else -> when {
+            ext in ImageExtensions -> v(Icons.Default.Image, Tone.Media)
+            ext in AudioExtensions -> v(Icons.Default.MusicNote, Tone.Audio)
+            ext in DocExtensions -> v(Icons.Default.Description, Tone.Document)
+            ext in CodeExtensions -> v(Icons.Default.Code)
+            else -> v(Icons.AutoMirrored.Filled.InsertDriveFile)
+        }
     }
 }
 
@@ -1000,6 +1156,7 @@ private fun folderIconFor(name: String): ImageVector = when (name.lowercase()) {
 private fun BottomActionBar(
     moreMenu: @Composable (Modifier) -> Unit,
     selectedCount: Int,
+    selectedName: String?,
     singleFile: FileItem?,
     onCopy: () -> Unit,
     onMove: () -> Unit,
@@ -1025,6 +1182,16 @@ private fun BottomActionBar(
                 softWrap = false,
                 overflow = TextOverflow.Ellipsis
             )
+            // With one item selected, show its complete name (wrapping onto extra lines if needed).
+            if (selectedName != null) {
+                Text(
+                    text = selectedName,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 4,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -1061,7 +1228,8 @@ private fun BottomActionBar(
                     modifier = Modifier.weight(1f),
                     contentPadding = PaddingValues(horizontal = 8.dp),
                     colors = ButtonDefaults.buttonColors(
-                        containerColor = MaterialTheme.colorScheme.error
+                        containerColor = Color(0xFFE5251B),
+                        contentColor = Color.White
                     )
                 ) {
                     Icon(
@@ -1201,48 +1369,13 @@ private fun QuickAccessSheet(
     var editing by remember { mutableStateOf(false) }
     var editTarget by remember { mutableStateOf<QuickFolder?>(null) }
     var confirmReset by remember { mutableStateOf(false) }
-    // The sheet is only as tall as its content: a few pins make a small sheet, many pins a tall one.
-    // Pinning, hidden files and settings sit behind "More options" so they don't add empty space.
-    val density = LocalDensity.current
-    // Estimated until the list has been measured, then exact.
-    var listHeight by remember { mutableStateOf((100 + (connections.size + folders.size) * 60).dp) }
-    var listPx by remember { mutableIntStateOf(0) }
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    // An iOS-style sheet with two detents: a short one showing the pins, and a full one (pull up) that shows the extras too.
+    // The whole content is laid out from the start, so going between the two is only the sheet sliding: nothing loads,
+    // measures or resizes while you drag. Pull down from full to get back to the short one; pull further to close.
+    // (The short detent is exactly as tall as the pins, so it grows and shrinks with how many there are.)
+    val sheet = remember { DetentSheetState() }
     val sheetScroll = rememberScrollState()
-    // The sheet resizes once the list is measured; make sure it opens showing the title, not scrolled down.
-    var userScrolled by remember { mutableStateOf(false) }
-    var dragFrom by remember { mutableIntStateOf(0) }
-    LaunchedEffect(sheetScroll) {
-        sheetScroll.interactionSource.interactions.collect {
-            if (it is androidx.compose.foundation.interaction.DragInteraction.Start) {
-                userScrolled = true
-                dragFrom = sheetScroll.value
-            }
-        }
-    }
-    LaunchedEffect(listPx) { if (!userScrolled) sheetScroll.scrollTo(0) }
-    // Until the user touches the sheet it stays on the pins page, whatever the layout does while it opens.
-    LaunchedEffect(sheetScroll) {
-        androidx.compose.runtime.snapshotFlow { sheetScroll.value }.collect { v ->
-            if (!userScrolled && v != 0) sheetScroll.scrollTo(0)
-        }
-    }
-    // Two pages: the pins, and the extras below them. Letting go between the two settles on the nearer one.
-    // Once inside the extras, scrolling is free.
-    LaunchedEffect(sheetScroll) {
-        androidx.compose.runtime.snapshotFlow { sheetScroll.isScrollInProgress }.collect { moving ->
-            if (!moving && userScrolled && chooserPath == null && listPx > 0) {
-                val page = minOf(listPx, sheetScroll.maxValue)
-                val v = sheetScroll.value
-                if (page > 0 && v in 1 until page) {
-                    // Started on the pins page: past 30% of the way, go to the extras. Started on the extras: past 30% back, go to the pins.
-                    val fromExtras = dragFrom >= page / 2
-                    val target = if (fromExtras) { if (v < page * 0.7f) 0 else page } else { if (v > page * 0.3f) page else 0 }
-                    sheetScroll.animateScrollTo(target)
-                }
-            }
-        }
-    }
+    val atFull = sheet.isFull
     val scope = rememberCoroutineScope()
 
     // When the chooser opens, scroll the sheet so the "Pin a folder" section moves to the top.
@@ -1250,7 +1383,7 @@ private fun QuickAccessSheet(
     LaunchedEffect(chooserPath != null) {
         if (chooserPath != null) {
             // The chooser grows the content, so open the sheet fully first; a half-height sheet would re-anchor.
-            sheetState.expand()
+            sheet.expand()
             withFrameNanos { }
             withFrameNanos { }
             sheetScroll.animateScrollTo(sheetScroll.maxValue)
@@ -1260,7 +1393,7 @@ private fun QuickAccessSheet(
     // Slide the sheet away first, then run the action. Removing the sheet from composition
     // straight away cut its exit animation short and made the navigation jolt.
     val closeThen: (() -> Unit) -> Unit = { action ->
-        scope.launch { sheetState.hide() }.invokeOnCompletion {
+        scope.launch { sheet.hide() }.invokeOnCompletion {
             onDismiss()
             action()
         }
@@ -1297,27 +1430,24 @@ private fun QuickAccessSheet(
         dismissButton = { TextButton(onClick = { confirmReset = false }) { Text("Cancel") } }
     )
 
-    ModalBottomSheet(
-        onDismissRequest = onDismiss,
-        sheetState = sheetState
+    DetentSheet(
+        state = sheet,
+        onDismissRequest = onDismiss
     ) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
-                // The sheet is only as tall as the quick-access list; the extras sit below it, so pulling up scrolls them in.
-                // While the folder chooser is open the sheet may use whatever height it needs.
-                .then(if (chooserPath == null) Modifier.heightIn(max = listHeight + 24.dp) else Modifier)
+                // Full height from the start: the short detent just shows the top part of it, so pulling up re-lays-out nothing.
+                .fillMaxHeight()
                 .verticalScroll(sheetScroll)
                 .padding(horizontal = 16.dp)
-                .padding(bottom = 24.dp),
+                .padding(bottom = 96.dp),   // room under the last row for the gesture bar, so Settings is never cut off
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
+            // The pins: the short detent is sized to exactly this block, so every pin is visible without pulling up.
             Column(
-                Modifier.fillMaxWidth().onSizeChanged { size ->
-                    listPx = size.height
-                    listHeight = with(density) { size.height.toDp() }
-                },
+                Modifier.fillMaxWidth().onSizeChanged { sheet.pinsPx = it.height },
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
@@ -1394,16 +1524,17 @@ private fun QuickAccessSheet(
                     }
                 }
             }
+            // Always laid out (just invisible once the sheet is full) so pulling up never changes the layout underneath.
             Text(
                 "Pull up for more", style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = if (atFull) 0f else 1f),
                 modifier = Modifier.align(Alignment.CenterHorizontally)
-                    .clickable { userScrolled = true; scope.launch { sheetScroll.animateScrollTo(listPx) } }.padding(8.dp)
+                    .clickable(enabled = !atFull) { scope.launch { sheet.expand() } }.padding(8.dp)
             )
             }
 
-            // At least one sheet-height tall, so the second page can scroll all the way up to start where the pins end.
-            Column(Modifier.heightIn(min = listHeight), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            // The extras: pinning, hidden files, settings.
+            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
 
             Text("Pin a folder", style = MaterialTheme.typography.titleMedium)

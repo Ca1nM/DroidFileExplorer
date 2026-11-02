@@ -76,6 +76,11 @@ class SettingsViewModel @Inject constructor(
     fun setBlackDark(enabled: Boolean) = appSettings.setBlackDark(enabled)
     fun setShowHidden(show: Boolean) = appSettings.setShowHidden(show)
     fun setThumbnails(v: Boolean) = appSettings.setShowThumbnails(v)
+    fun setAnimateThumbnails(v: Boolean) = appSettings.setAnimateThumbnails(v)
+    fun setAnimationLoop(v: Boolean) = appSettings.setAnimationLoop(v)
+    fun setAnimationMaxMb(v: Int) = appSettings.setAnimationMaxMb(v)
+    fun setSyntaxColours(v: Boolean) = appSettings.setSyntaxColours(v)
+    fun setOpenFromApp(v: String) = appSettings.setOpenFromApp(v)
     fun setTapOpens(v: Boolean) = appSettings.setTapOpens(v)
     fun setUseTrash(v: Boolean) = appSettings.setUseTrash(v)
     fun setTrashDays(v: Int) = appSettings.setTrashDays(v)
@@ -160,6 +165,31 @@ fun SettingsScreen(
                 checked = settings.showThumbnails,
                 onCheckedChange = { viewModel.setThumbnails(it) }
             )
+            if (settings.showThumbnails) {
+                SwitchRow(
+                    title = "Animate GIF thumbnails",
+                    description = "Play GIFs and animated WebP inside their thumbnails. Off: show a still picture.",
+                    checked = settings.animateThumbnails,
+                    onCheckedChange = { viewModel.setAnimateThumbnails(it) }
+                )
+                if (settings.animateThumbnails) {
+                    SwitchRow(
+                        title = "Loop animations",
+                        description = "Off: play once, then stop on the last frame",
+                        checked = settings.animationLoop,
+                        onCheckedChange = { viewModel.setAnimationLoop(it) }
+                    )
+                    Text("Only animate files smaller than", style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    listOf(5, 20, 40, 100, 0).forEach { mb ->
+                        OptionRow(
+                            title = if (mb == 0) "No limit" else "$mb MB",
+                            selected = settings.animationMaxMb == mb,
+                            onClick = { viewModel.setAnimationMaxMb(mb) }
+                        ) { RadioButton(selected = settings.animationMaxMb == mb, onClick = null) }
+                    }
+                }
+            }
             SwitchRow(
                 title = "Tap opens files",
                 description = "Tap a file to open it. Off: tapping selects it, like long-press.",
@@ -172,6 +202,31 @@ fun SettingsScreen(
                 checked = settings.dualPane,
                 onCheckedChange = { viewModel.setDualPane(it) }
             )
+
+            SwitchRow(
+                title = "Syntax colouring",
+                description = "Colour keywords, strings and comments in code, scripts, web, config and log files. Files over 200 KB stay plain.",
+                checked = settings.syntaxColours,
+                onCheckedChange = { viewModel.setSyntaxColours(it) }
+            )
+            Spacer(Modifier.height(8.dp))
+            Text("When another app opens a file", style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Text("For example tapping Open on a finished download in Firefox", style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            listOf(
+                AppSettings.FROM_APP_LOCATE to "Show it in its folder (scrolled to and highlighted)",
+                AppSettings.FROM_APP_OPEN to "Open it straight away"
+            ).forEach { (mode, label) ->
+                OptionRow(
+                    title = label,
+                    selected = settings.openFromApp == mode,
+                    onClick = { viewModel.setOpenFromApp(mode) }
+                ) { RadioButton(selected = settings.openFromApp == mode, onClick = null) }
+            }
+
+            SectionHeader("Default app for files")
+            DefaultAppSection()
 
             SectionHeader("Deleting")
             SwitchRow(

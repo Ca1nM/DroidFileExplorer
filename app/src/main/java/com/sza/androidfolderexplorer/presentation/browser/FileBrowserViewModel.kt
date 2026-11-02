@@ -7,6 +7,8 @@ import android.os.SystemClock
 import androidx.core.content.FileProvider
 import com.sza.androidfolderexplorer.data.FileKind
 import com.sza.androidfolderexplorer.data.FileTypes
+import com.sza.androidfolderexplorer.data.TextFiles
+import com.sza.androidfolderexplorer.data.formatSize
 import com.sza.androidfolderexplorer.data.diag.Diagnostics
 import com.sza.androidfolderexplorer.data.network.CloudNames
 import com.sza.androidfolderexplorer.data.ops.OpenRequests
@@ -76,6 +78,17 @@ class FileBrowserViewModel @Inject constructor(
 
     private var operationJob: Job? = null
 
+    /** Browsing inside an archive as if it were a folder; its state is [FileBrowserUiState.archiveView]. */
+    internal val archive = ArchiveViewController(
+        scope = viewModelScope,
+        context = context,
+        get = { _uiState.value.archiveView },
+        set = { _uiState.value = _uiState.value.copy(archiveView = it) },
+        message = { showSnackbar(it) },
+        goTo = { navigateTo(it) },
+        open = { openItem(it, readOnly = true) }   // a temporary copy: view it, don't edit it
+    )
+
     // Stored to retry navigation after permission grant
     private var pendingPath: String? = null
 
@@ -119,6 +132,34 @@ class FileBrowserViewModel @Inject constructor(
                 if (requested != null) {
                     navigateTo(requested)
                     OpenRequests.consume()
+                }
+            }
+        }
+        // A file another app asked to open ("Open with"): show its folder, then open it.
+        viewModelScope.launch {
+            OpenRequests.file.collect { req ->
+                if (req != null) {
+                    OpenRequests.consumeFile()
+                    val f = File(req.path)
+                    // A private copy lives in the app's cache, which isn't a place to browse; real files show their folder.
+                    if (!req.temporary) {
+                        f.parent?.let { navigateTo(it).join() }
+                        // Scroll to the file and flash its highlight, so it's easy to spot in its folder (a browser's "Open" on
+                        // a fresh download lands right on it), whether or not it can then be opened here.
+                        _uiState.value = _uiState.value.copy(highlightPath = f.absolutePath)
+                    }
+                    // Settings > Browser > "When another app opens a file": by default stop here, on the highlighted file. A
+                    // private cache copy has no folder to show, so it is always opened.
+                    if (!req.temporary && appSettings.state.value.openFromApp == com.sza.androidfolderexplorer.data.settings.AppSettings.FROM_APP_LOCATE) {
+                        return@collect
+                    }
+                    // Some test/speed-test downloads are named .zip but hold random data. Opening those as an archive only
+                    // gives an error page, so stay in the folder on the highlighted file and say what's wrong.
+                    if (com.sza.androidfolderexplorer.data.FileTypes.ext(f.name) == "zip" && !looksLikeZip(f)) {
+                        showSnackbar("${f.name} isn't a real zip archive (it doesn't contain zip data), so it can't be opened.")
+                        return@collect
+                    }
+                    openItem(FileItem(f.name, f.absolutePath, false, f.length(), f.lastModified()), readOnly = req.temporary)
                 }
             }
         }
@@ -243,7 +284,8 @@ class FileBrowserViewModel @Inject constructor(
     fun openViewer(path: String) {
         val images = _uiState.value.items.filter { !it.isDirectory && isImageFile(it.name) }.map { it.path }
         val index = images.indexOf(path)
-        if (index < 0) return
+        // Not in the folder on screen (a file from inside an archive, or opened from another app): show just that image.
+        if (index < 0) { viewImage(path); return }
         _uiState.value = _uiState.value.copy(viewerPaths = images, viewerIndex = index, showQuickAccess = false)
     }
 
@@ -383,8 +425,10 @@ class FileBrowserViewModel @Inject constructor(
                 showSnackbar("Extracted $count file(s) to ${destDir.name}")
                 navigateTo(destDir.absolutePath)
             } catch (e: CancellationException) {
+                ArchiveExtractor.removeIfEmpty(destDir)
                 throw e
             } catch (e: Exception) {
+                ArchiveExtractor.removeIfEmpty(destDir)
                 Log.e("AFEX_EXTRACT", "extract failed", e)
                 _uiState.value = _uiState.value.copy(
                     operation = OperationState.Failed(e.message ?: "Extraction failed")
@@ -475,29 +519,71 @@ class FileBrowserViewModel @Inject constructor(
 
     // ---- Opening files ----
 
-    /** Tap on a file: open it in the right built-in viewer, or hand it to another app. */
-    fun openItem(item: FileItem) {
-        userData.addRecent(item.path, false)
-        when (FileTypes.kindOf(item.name)) {
+    /**
+     * Tap on a file: open it in the right built-in viewer or editor, or hand it to another app. Text, config, JSON, XML,
+     * CSV, Markdown and log files open in the editor. [readOnly] is for temporary copies (a file taken out of an
+     * archive, or handed over by another app): edits there would be lost, so those open in the read-only viewers.
+     */
+    /** Where an archive opened by [openTemporary] extracts to, while that call runs. */
+    private var archiveHome: String? = null
+
+    /**
+     * Opens a temporary copy (a file fetched from a server or cloud account) read-only. If it is an archive, "Extract"
+     * puts the result in [extractTo] instead of the cache folder the copy sits in.
+     */
+    fun openTemporary(item: FileItem, extractTo: String) {
+        archiveHome = extractTo
+        try { openItem(item, readOnly = true) } finally { archiveHome = null }
+    }
+
+    fun openItem(item: FileItem, readOnly: Boolean = false) {
+        if (!readOnly) { userData.addRecent(item.path, false); lastOpened = item.path }
+        val kind = FileTypes.kindOf(item.name)
+        val editable = !readOnly && item.size <= TextFiles.MAX_EDIT_BYTES
+        fun text(hint: FileKindHint) = when {
+            editable -> openEditor(item.path)
+            !readOnly -> {
+                showSnackbar("Too big to edit (limit ${formatSize(TextFiles.MAX_EDIT_BYTES)}); opened read-only")
+                showDialog(BrowserDialog.Viewer(item.path, hint))
+            }
+            else -> showDialog(BrowserDialog.Viewer(item.path, hint))
+        }
+        // .bin and .img can be a CD/disc image (browse it like an ISO), a text file in disguise (edit it like a .txt),
+        // or raw binary data (show the bytes; a text editor would corrupt it).
+        if (FileTypes.ext(item.name) in setOf("bin", "img")) {
+            val file = File(item.path)
+            when {
+                ArchiveExtractor.looksLikeDiscImage(file) -> archive.open(item.path, archiveHome)
+                TextFiles.looksLikeText(file) -> text(FileKindHint.TEXT)
+                else -> showDialog(BrowserDialog.Viewer(item.path, FileKindHint.HEX))
+            }
+            return
+        }
+        when (kind) {
             FileKind.IMAGE -> openViewer(item.path)
             FileKind.VIDEO, FileKind.AUDIO -> playMedia(item)
-            FileKind.ARCHIVE -> showDialog(BrowserDialog.ArchiveBrowser(item.path))
+            FileKind.ARCHIVE -> archive.open(item.path, archiveHome)
             FileKind.APK -> showDialog(BrowserDialog.ApkInfo(item.path))
             FileKind.PDF -> showDialog(BrowserDialog.Viewer(item.path, FileKindHint.PDF))
-            FileKind.MARKDOWN -> showDialog(BrowserDialog.Viewer(item.path, FileKindHint.MARKDOWN))
-            FileKind.JSON -> showDialog(BrowserDialog.Viewer(item.path, FileKindHint.JSON))
-            FileKind.XML -> showDialog(BrowserDialog.Viewer(item.path, FileKindHint.XML))
-            FileKind.CSV -> showDialog(BrowserDialog.Viewer(item.path, FileKindHint.CSV))
-            FileKind.LOG -> showDialog(BrowserDialog.Viewer(item.path, FileKindHint.LOG))
-            FileKind.TEXT -> openEditor(item.path)
+            FileKind.MARKDOWN -> text(FileKindHint.MARKDOWN)
+            FileKind.JSON -> text(FileKindHint.JSON)
+            FileKind.XML -> text(FileKindHint.XML)
+            FileKind.CSV -> text(FileKindHint.CSV)
+            FileKind.LOG -> text(FileKindHint.LOG)
+            FileKind.TEXT -> text(FileKindHint.TEXT)
+            FileKind.DOCUMENT, FileKind.DATABASE -> showDialog(BrowserDialog.Document(item.path))
             FileKind.SPLIT_PART -> showDialog(BrowserDialog.Split(item.path))
-            FileKind.OTHER -> showDialog(BrowserDialog.OpenAs(item.path))
+            // Unknown extension (".bashrc", "Dockerfile", "hosts", ".env" ...): plain text opens as text.
+            FileKind.OTHER -> if (TextFiles.looksLikeText(File(item.path))) text(FileKindHint.TEXT)
+                else showDialog(BrowserDialog.OpenAs(item.path))
         }
     }
 
     private fun playMedia(item: FileItem) {
         val playlist = _uiState.value.items.filter { !it.isDirectory && FileTypes.isMedia(it.name) }.map { it.path }
-        val index = playlist.indexOf(item.path).coerceAtLeast(0)
+        val index = playlist.indexOf(item.path)
+        // Not in the folder on screen (inside an archive, or from another app): play just this file.
+        if (index < 0) { playFile(item.path); return }
         context.startActivity(PlayerActivity.intent(context, playlist, index).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
     }
 
@@ -650,12 +736,32 @@ class FileBrowserViewModel @Inject constructor(
             .onFailure { error -> showSnackbar("Couldn't refresh: ${error.message ?: "unknown error"}") }
     }
 
+    /** A real zip starts with "PK" and a section marker (local header, empty archive, or spanned archive). */
+    private fun looksLikeZip(f: File): Boolean = runCatching {
+        f.inputStream().use { input ->
+            val b = ByteArray(4)
+            input.read(b) == 4 && b[0] == 'P'.code.toByte() && b[1] == 'K'.code.toByte() &&
+                ((b[2].toInt() == 3 && b[3].toInt() == 4) || (b[2].toInt() == 5 && b[3].toInt() == 6) || (b[2].toInt() == 7 && b[3].toInt() == 8))
+        }
+    }.getOrDefault(true)   // if it can't be read here, let the normal open path report the real error
+
     fun clearHighlight() {
         if (_uiState.value.highlightPath != null) _uiState.value = _uiState.value.copy(highlightPath = null)
     }
 
+    /** The last file opened from the folder on screen; highlighted (and scrolled to) when the person comes back from it. */
+    private var lastOpened: String? = null
+
+    fun highlightLastOpened() {
+        val p = lastOpened ?: return
+        lastOpened = null
+        if (_uiState.value.items.any { it.path == p }) _uiState.value = _uiState.value.copy(highlightPath = p)
+    }
+
     fun navigateTo(path: String): kotlinx.coroutines.Job {
         val previous = _uiState.value.currentPath
+        // Moving to another folder: whatever was opened before is no longer on screen. (A refresh of the same folder keeps it.)
+        if (path != previous) lastOpened = null
         return viewModelScope.launch {
             _uiState.value = _uiState.value.copy(
                 isLoading = true,
@@ -690,7 +796,8 @@ class FileBrowserViewModel @Inject constructor(
                         items = visibleItems(items),
                         isLoading = false,
                         pathSegments = buildPathSegments(path),
-                        highlightPath = leftChild
+                        // A refresh of the folder already on screen must not wipe the highlight of the file just closed.
+                        highlightPath = leftChild ?: _uiState.value.highlightPath.takeIf { path == previous }
                     )
                 }
                 .onFailure { error ->

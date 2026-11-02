@@ -11,6 +11,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
@@ -75,7 +76,7 @@ fun TrashScreen(onBack: () -> Unit, viewModel: TrashViewModel = hiltViewModel())
     LaunchedEffect(viewModel.message) { viewModel.message?.let { snack.showSnackbar(it); viewModel.message = null } }
 
     Scaffold(
-        snackbarHost = { SnackbarHost(snack) },
+        snackbarHost = { com.sza.androidfolderexplorer.ui.theme.AppSnackbarHost(snack) },
         topBar = {
             TopAppBar(
                 title = { Text(if (selected.isEmpty()) "Trash" else "${selected.size} selected") },
@@ -114,13 +115,18 @@ fun TrashScreen(onBack: () -> Unit, viewModel: TrashViewModel = hiltViewModel())
                         Icon(Icons.Default.Restore, contentDescription = "Restore ${e.name}", tint = MaterialTheme.colorScheme.primary)
                     }
                     Spacer(Modifier.width(4.dp))
-                    Icon(if (e.isDirectory) Icons.Default.Folder else Icons.Default.InsertDriveFile, null, tint = MaterialTheme.colorScheme.primary)
+                    // The deleted file still sits in the trash folder, so its preview can be decoded as usual.
+                    val trashed = remember(e.id) {
+                        com.sza.androidfolderexplorer.domain.model.FileItem(e.name, e.trashedPath, e.isDirectory, e.size, e.deletedAt)
+                    }
+                    com.sza.androidfolderexplorer.presentation.browser.FileTile(trashed)
                     Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
                         Text(e.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
                         Text(
-                            "${e.originalPath.removePrefix("/storage/emulated/0").substringBeforeLast('/').ifEmpty { "/" }} · " +
-                                (if (e.isDirectory) "folder" else formatSize(e.size)) + " · $daysLeft day(s) left",
+                            (if (e.isDirectory) "folder · " else com.sza.androidfolderexplorer.presentation.browser.typeLabelOf(e.name)?.plus(" · ") ?: "") +
+                                "${e.originalPath.removePrefix("/storage/emulated/0").substringBeforeLast('/').ifEmpty { "/" }} · " +
+                                (if (e.isDirectory) "" else formatSize(e.size) + " · ") + "$daysLeft day(s) left",
                             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1, overflow = TextOverflow.Ellipsis
                         )

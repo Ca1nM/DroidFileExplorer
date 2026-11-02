@@ -21,6 +21,14 @@ data class Settings(
     val showHidden: Boolean = false,
     /** Show image, video and APK previews instead of type icons. */
     val showThumbnails: Boolean = true,
+    /** Play GIFs and animated WebP in their thumbnails; [animationLoop] repeats forever, [animationMaxMb] caps the file size. */
+    val animateThumbnails: Boolean = true,
+    val animationLoop: Boolean = true,
+    val animationMaxMb: Int = 40,   // 0 = no limit
+    /** Colour code, scripts, config, web and log files in the text editor. */
+    val syntaxColours: Boolean = true,
+    /** What happens when another app (a browser's "Open") hands over a file: [AppSettings.FROM_APP_LOCATE] or [AppSettings.FROM_APP_OPEN]. */
+    val openFromApp: String = AppSettings.FROM_APP_LOCATE,
     /** Tapping a file opens it; when off, tapping selects it (the original behaviour). */
     val tapOpens: Boolean = true,
     /** Delete moves to the in-app trash; items older than [trashDays] are purged. */
@@ -43,11 +51,18 @@ class AppSettings @Inject constructor(@ApplicationContext context: Context) {
     private val _state = MutableStateFlow(load())
     val state: StateFlow<Settings> = _state.asStateFlow()
 
+    init { ThumbOptions.apply(_state.value); EditorOptions.apply(_state.value) }
+
     fun setThemeMode(mode: ThemeMode) = update(_state.value.copy(themeMode = mode)) { putString(KEY_THEME_MODE, mode.name) }
     fun setAccent(accent: String) = update(_state.value.copy(accent = accent)) { putString(KEY_ACCENT, accent) }
     fun setBlackDark(enabled: Boolean) = update(_state.value.copy(blackDark = enabled)) { putBoolean(KEY_BLACK_DARK, enabled) }
     fun setShowHidden(show: Boolean) = update(_state.value.copy(showHidden = show)) { putBoolean(KEY_SHOW_HIDDEN, show) }
     fun setShowThumbnails(v: Boolean) = update(_state.value.copy(showThumbnails = v)) { putBoolean("thumbnails", v) }
+    fun setAnimateThumbnails(v: Boolean) = update(_state.value.copy(animateThumbnails = v)) { putBoolean("animate_thumbs", v) }
+    fun setAnimationLoop(v: Boolean) = update(_state.value.copy(animationLoop = v)) { putBoolean("animation_loop", v) }
+    fun setAnimationMaxMb(v: Int) = update(_state.value.copy(animationMaxMb = v)) { putInt("animation_max_mb", v) }
+    fun setSyntaxColours(v: Boolean) = update(_state.value.copy(syntaxColours = v)) { putBoolean("syntax_colours", v) }
+    fun setOpenFromApp(v: String) = update(_state.value.copy(openFromApp = v)) { putString("open_from_app", v) }
     fun setTapOpens(v: Boolean) = update(_state.value.copy(tapOpens = v)) { putBoolean("tap_opens", v) }
     fun setUseTrash(v: Boolean) = update(_state.value.copy(useTrash = v)) { putBoolean("use_trash", v) }
     fun setTrashDays(v: Int) = update(_state.value.copy(trashDays = v)) { putInt("trash_days", v) }
@@ -59,6 +74,8 @@ class AppSettings @Inject constructor(@ApplicationContext context: Context) {
     private inline fun update(new: Settings, write: android.content.SharedPreferences.Editor.() -> Unit) {
         prefs.edit().apply(write).apply()
         _state.value = new
+        ThumbOptions.apply(new)
+        EditorOptions.apply(new)
     }
 
     private fun load(): Settings = Settings(
@@ -69,6 +86,11 @@ class AppSettings @Inject constructor(@ApplicationContext context: Context) {
         blackDark = prefs.getBoolean(KEY_BLACK_DARK, false),
         showHidden = prefs.getBoolean(KEY_SHOW_HIDDEN, false),
         showThumbnails = prefs.getBoolean("thumbnails", true),
+        animateThumbnails = prefs.getBoolean("animate_thumbs", true),
+        animationLoop = prefs.getBoolean("animation_loop", true),
+        animationMaxMb = prefs.getInt("animation_max_mb", 40),
+        syntaxColours = prefs.getBoolean("syntax_colours", true),
+        openFromApp = prefs.getString("open_from_app", FROM_APP_LOCATE)?.takeIf { it == FROM_APP_OPEN } ?: FROM_APP_LOCATE,
         tapOpens = prefs.getBoolean("tap_opens", true),
         useTrash = prefs.getBoolean("use_trash", true),
         trashDays = prefs.getInt("trash_days", 30),
@@ -96,10 +118,16 @@ class AppSettings @Inject constructor(@ApplicationContext context: Context) {
         }
         e.commit()
         _state.value = load()
+        ThumbOptions.apply(_state.value)
+        EditorOptions.apply(_state.value)
     }
 
     companion object {
         const val ACCENT_WALLPAPER = "wallpaper"
+        /** A file another app opens: show its folder with the file scrolled to and highlighted (default)... */
+        const val FROM_APP_LOCATE = "locate"
+        /** ...or open the file straight away (its folder is shown behind it). */
+        const val FROM_APP_OPEN = "open"
         /** Accent ids that start with this prefix hold a custom colour as "custom:AARRGGBB". */
         const val ACCENT_CUSTOM_PREFIX = "custom:"
         // "afex_prefs" and "show_hidden" match the keys the browser already used.

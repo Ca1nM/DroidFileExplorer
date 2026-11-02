@@ -1,4 +1,4 @@
-package com.sza.androidfolderexplorer.presentation.browser
+﻿package com.sza.androidfolderexplorer.presentation.browser
 
 import com.sza.androidfolderexplorer.domain.model.FileItem
 import com.sza.androidfolderexplorer.domain.model.OperationProgress
@@ -49,7 +49,9 @@ data class FileBrowserUiState(
     val haptics: Boolean = true,
     val sounds: Boolean = false,
     val dualPane: Boolean = true,
-    val showOnboarding: Boolean = false
+    val showOnboarding: Boolean = false,
+    /** The archive being browsed like a folder, or null when none is open. */
+    val archiveView: ArchiveViewState? = null
 ) {
     val hasSelection: Boolean get() = selectedPaths.isNotEmpty()
     val allSelected: Boolean get() = items.isNotEmpty() && selectedPaths.size == items.size
@@ -62,6 +64,27 @@ data class FileBrowserUiState(
         const val DEFAULT_PATH = "/storage/emulated/0/Android"
     }
 }
+
+/**
+ * An archive opened as a folder. [folder] is the path inside the archive ("" = its root); [selected] holds the
+ * paths of the rows ticked for "Extract selected" (a folder row stands for everything under it).
+ */
+data class ArchiveViewState(
+    val archivePath: String,
+    val folder: String = "",
+    val entries: List<com.sza.androidfolderexplorer.data.source.ArchiveEntryInfo>? = null,
+    val needsPassword: Boolean = false,
+    val password: String = "",
+    val error: String? = null,
+    val selected: Set<String> = emptySet(),
+    val busy: Boolean = false,
+    val progress: Float? = null,
+    val status: String? = null,
+    /** Folder that "Extract" writes into: always the real folder of the outermost archive, even when nested. */
+    val homeDir: String = "",
+    /** The archive this one was opened from (an archive inside an archive); Back at the top level returns to it. */
+    val parent: ArchiveViewState? = null
+)
 
 /** One-tap filters shown as chips under the toolbar. */
 enum class QuickFilter(val label: String) {
@@ -116,7 +139,7 @@ sealed interface BrowserDialog {
     data class SetDate(val path: String) : BrowserDialog
     data class Split(val path: String) : BrowserDialog
     data class Compare(val a: String, val b: String) : BrowserDialog
-    data class ArchiveBrowser(val path: String) : BrowserDialog
+    data class Document(val path: String) : BrowserDialog
     data class BulkRename(val paths: List<String>) : BrowserDialog
     data class ImageBatch(val paths: List<String>) : BrowserDialog
     data class Actions(val paths: List<String>) : BrowserDialog

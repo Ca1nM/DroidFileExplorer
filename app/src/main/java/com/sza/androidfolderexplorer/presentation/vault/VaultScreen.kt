@@ -140,7 +140,7 @@ fun VaultScreen(onBack: () -> Unit, viewModel: VaultViewModel = hiltViewModel())
     }
 
     Scaffold(
-        snackbarHost = { SnackbarHost(snack) },
+        snackbarHost = { com.sza.androidfolderexplorer.ui.theme.AppSnackbarHost(snack) },
         topBar = {
             TopAppBar(
                 title = { Text("Private vault") },
@@ -172,7 +172,7 @@ fun VaultScreen(onBack: () -> Unit, viewModel: VaultViewModel = hiltViewModel())
                         ListItem(
                             headlineContent = { Text(e.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
                             supportingContent = { Text(formatSize(e.size)) },
-                            leadingContent = { Icon(Icons.Default.InsertDriveFile, null) },
+                            leadingContent = { Icon(com.sza.androidfolderexplorer.presentation.browser.fileIconFor(e.name), null) },
                             trailingContent = {
                                 Row {
                                     IconButton(onClick = { viewModel.export(e) }) { Icon(Icons.Default.Download, "Decrypt to Downloads") }
