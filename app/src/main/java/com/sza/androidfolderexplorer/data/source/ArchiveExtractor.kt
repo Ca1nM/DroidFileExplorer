@@ -31,11 +31,12 @@ object ArchiveExtractor {
 
     fun isSupported(fileName: String): Boolean {
         val lower = fileName.lowercase()
-        return (compoundSuffixes + singleSuffixes).any { lower.endsWith(it) }
+        return RarSupport.isRar(fileName) || (compoundSuffixes + singleSuffixes).any { lower.endsWith(it) }
     }
 
-    /** "photos.tar.gz" -> "photos", "backup.zip" -> "backup". */
+    /** "photos.tar.gz" -> "photos", "backup.zip" -> "backup", "game.part2.rar" -> "game". */
     fun folderNameFor(fileName: String): String {
+        if (RarSupport.isRar(fileName)) return RarSupport.folderNameFor(fileName)
         val lower = fileName.lowercase()
         val suffix = (compoundSuffixes + singleSuffixes)
             .sortedByDescending { it.length }
@@ -44,12 +45,23 @@ object ArchiveExtractor {
     }
 
     /** Extracts [archive] into [destDir] (created if missing). Returns the number of files written. */
-    suspend fun extract(archive: File, destDir: File, onEntry: (String) -> Unit): Int =
+    suspend fun extract(
+        archive: File,
+        destDir: File,
+        onProgress: (done: Long, total: Long) -> Unit = { _, _ -> },
+        onEntry: (String) -> Unit
+    ): Int =
         withContext(Dispatchers.IO) {
             destDir.mkdirs()
             val lower = archive.name.lowercase()
+            // Multi-core path for 7z files made of independent LZMA2 blocks; null means "not suitable".
+            if (lower.endsWith(".7z")) {
+                tryParallelSevenZ(archive, destDir, null, onEntry, onProgress)?.let { return@withContext it }
+            }
             when {
-                lower.endsWith(".zip") -> extractZip(archive, destDir, onEntry)
+                RarSupport.handles(archive.name) ->
+                    RarSupport.extract(archive, destDir, null, null, onEntry, onProgress, rejectEncrypted = true)
+                lower.endsWith(".zip") -> extractZip(archive, destDir, onEntry, onProgress)
                 lower.endsWith(".7z") -> extractSevenZip(archive, destDir, onEntry)
                 lower.endsWith(".iso") -> extractIso(archive, destDir, onEntry)
                 lower.endsWith(".tar") ->
@@ -67,11 +79,46 @@ object ArchiveExtractor {
     private fun buffered(file: File) = BufferedInputStream(FileInputStream(file))
 
     /**
+     * Extracts a .7z on several cores when its LZMA2 data is split into independent blocks (7-Zip does that for
+     * big archives). Returns the number of files written, or null when the archive isn't suitable (filters,
+     * encryption, a single block, no memory); nothing has been written in that case and the caller falls back.
+     * [only] limits extraction to those file paths inside the archive.
+     */
+    suspend fun tryParallelSevenZ(
+        archive: File,
+        destDir: File,
+        only: Set<String>?,
+        onEntry: (String) -> Unit,
+        onProgress: (done: Long, total: Long) -> Unit
+    ): Int? {
+        val job = currentCoroutineContext()[kotlinx.coroutines.Job]
+        return try {
+            ParallelSevenZip.extract(
+                archive, destDir, only, 0,
+                { done, total -> onProgress(done, total) },
+                { path -> onEntry(path) },
+                { job != null && !job.isActive },
+                { msg -> android.util.Log.i("AFEX_EXTRACT", msg) }
+            )
+        } catch (e: ParallelSevenZip.Unsupported) {
+            android.util.Log.i("AFEX_EXTRACT", "parallel 7z not used: ${e.message}")
+            null
+        } catch (e: ParallelSevenZip.Cancelled) {
+            throw kotlinx.coroutines.CancellationException("Extraction cancelled")
+        }
+    }
+
+    /**
      * Zips are read through the central directory (random access) so entries stored with data
      * descriptors, zip64 archives and Deflate64 all work. A damaged zip with no usable central
      * directory falls back to reading it as a stream.
      */
-    private suspend fun extractZip(archive: File, destDir: File, onEntry: (String) -> Unit): Int {
+    private suspend fun extractZip(
+        archive: File,
+        destDir: File,
+        onEntry: (String) -> Unit,
+        onProgress: (done: Long, total: Long) -> Unit = { _, _ -> }
+    ): Int {
         if (ArchiveTools.isEncryptedZip(archive)) {
             throw IOException("This zip is password-protected. Tap it to open the archive browser and enter the password there.")
         }
@@ -85,8 +132,11 @@ object ArchiveExtractor {
             )
         }
         var written = 0
+        var done = 0L
         zf.use { zip ->
-            for (entry in java.util.Collections.list(zip.entries)) {
+            val all = java.util.Collections.list(zip.entries)
+            val total = all.sumOf { if (it.isDirectory) 0L else maxOf(it.size, 0L) }
+            for (entry in all) {
                 currentCoroutineContext().ensureActive()
                 val target = safeTarget(destDir, entry.name) ?: continue
                 if (entry.isDirectory) { target.mkdirs(); continue }
@@ -97,6 +147,8 @@ object ArchiveExtractor {
                 zip.getInputStream(entry).use { input -> FileOutputStream(target).use { out -> input.copyTo(out) } }
                 if (entry.time > 0) target.setLastModified(entry.time)
                 written++
+                done += maxOf(entry.size, 0L)
+                onProgress(done, total)
                 onEntry(entry.name)
             }
         }

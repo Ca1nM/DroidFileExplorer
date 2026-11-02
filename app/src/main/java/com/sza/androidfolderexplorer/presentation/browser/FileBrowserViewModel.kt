@@ -360,19 +360,28 @@ class FileBrowserViewModel @Inject constructor(
             )
             try {
                 var extracted = 0
-                val count = ArchiveExtractor.extract(archive, destDir) { entryName ->
-                    extracted++
+                var currentName = archive.name
+                var doneBytes = 0L
+                var totalBytes = 0L
+                fun publish() {
                     _uiState.value = _uiState.value.copy(
                         operation = OperationState.InProgress(
-                            OperationProgress(0, extracted, entryName, 0L, 0L)
+                            OperationProgress(0, extracted, currentName, totalBytes, doneBytes)
                         )
                     )
                 }
-                _uiState.value = _uiState.value.copy(
-                    operation = OperationState.Completed("Extracted $count file(s) to ${destDir.name}"),
-                    selectedPaths = emptySet()
-                )
-                navigateTo(_uiState.value.currentPath)
+                val count = ArchiveExtractor.extract(
+                    archive, destDir,
+                    onProgress = { done, total -> doneBytes = done; totalBytes = total; publish() }
+                ) { entryName ->
+                    extracted++
+                    currentName = entryName
+                    publish()
+                }
+                // Close the progress window and open the new folder instead of asking for an "OK".
+                _uiState.value = _uiState.value.copy(operation = null, selectedPaths = emptySet())
+                showSnackbar("Extracted $count file(s) to ${destDir.name}")
+                navigateTo(destDir.absolutePath)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -472,9 +481,7 @@ class FileBrowserViewModel @Inject constructor(
         when (FileTypes.kindOf(item.name)) {
             FileKind.IMAGE -> openViewer(item.path)
             FileKind.VIDEO, FileKind.AUDIO -> playMedia(item)
-            FileKind.ARCHIVE ->
-                if (item.name.endsWith(".rar", true)) showSnackbar("RAR archives can't be opened here")
-                else showDialog(BrowserDialog.ArchiveBrowser(item.path))
+            FileKind.ARCHIVE -> showDialog(BrowserDialog.ArchiveBrowser(item.path))
             FileKind.APK -> showDialog(BrowserDialog.ApkInfo(item.path))
             FileKind.PDF -> showDialog(BrowserDialog.Viewer(item.path, FileKindHint.PDF))
             FileKind.MARKDOWN -> showDialog(BrowserDialog.Viewer(item.path, FileKindHint.MARKDOWN))
@@ -631,8 +638,25 @@ class FileBrowserViewModel @Inject constructor(
         shizukuFileAccess.removePermissionListener(shizukuPermissionListener)
     }
 
-    fun navigateTo(path: String) {
-        viewModelScope.launch {
+    /** Reloads the folder on screen in place, without blanking it. Used by pull-to-refresh. */
+    fun refresh(): kotlinx.coroutines.Job = viewModelScope.launch {
+        val path = _uiState.value.currentPath
+        browseDirectory(path)
+            .onSuccess { items ->
+                if (_uiState.value.currentPath == path) {
+                    _uiState.value = _uiState.value.copy(items = visibleItems(items), error = null)
+                }
+            }
+            .onFailure { error -> showSnackbar("Couldn't refresh: ${error.message ?: "unknown error"}") }
+    }
+
+    fun clearHighlight() {
+        if (_uiState.value.highlightPath != null) _uiState.value = _uiState.value.copy(highlightPath = null)
+    }
+
+    fun navigateTo(path: String): kotlinx.coroutines.Job {
+        val previous = _uiState.value.currentPath
+        return viewModelScope.launch {
             _uiState.value = _uiState.value.copy(
                 isLoading = true,
                 error = null,
@@ -656,11 +680,17 @@ class FileBrowserViewModel @Inject constructor(
                     if (path != FileBrowserUiState.STORAGE_ROOT && !path.startsWith(TrashManager.TRASH_DIR)) {
                         userData.addRecent(path, true)
                     }
+                    // Going up: remember which child of this folder we just came out of, so it can be highlighted.
+                    val base = path.trimEnd('/')
+                    val leftChild = if (previous.startsWith("$base/")) {
+                        "$base/" + previous.removePrefix("$base/").substringBefore('/')
+                    } else null
                     _uiState.value = _uiState.value.copy(
                         currentPath = path,
                         items = visibleItems(items),
                         isLoading = false,
-                        pathSegments = buildPathSegments(path)
+                        pathSegments = buildPathSegments(path),
+                        highlightPath = leftChild
                     )
                 }
                 .onFailure { error ->

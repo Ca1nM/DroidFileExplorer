@@ -9,6 +9,8 @@ data class FileBrowserUiState(
     val selectedPaths: Set<String> = emptySet(),
     val isLoading: Boolean = true,
     val error: String? = null,
+    /** The folder the user just backed out of, highlighted briefly in its parent; null otherwise. */
+    val highlightPath: String? = null,
     val operation: OperationState? = null,
     val pathSegments: List<PathSegment> = emptyList(),
     val accessPrompt: AccessPromptState? = null,

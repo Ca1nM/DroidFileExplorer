@@ -20,6 +20,11 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // 7-Zip JBinding for Android (reads RAR and RAR5, including split archives).
+        maven {
+            url = uri("https://jitpack.io")
+            content { includeGroup("com.github.omicronapps") }
+        }
     }
 }
 

@@ -42,6 +42,14 @@ android {
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
+    // Native LZMA2 decoder used for multi-core 7z extraction (src/main/cpp).
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
     signingConfigs {
         create("release") {
             storeFile = file("${rootProject.rootDir}/keys/release.keystore")
@@ -151,6 +159,7 @@ dependencies {
     implementation(libs.window)
     // Password-protected zip create/extract and integrity test
     implementation(libs.zip4j)
+    implementation("com.github.omicronapps:7-Zip-JBinding-4Android:Release-16.02-2.03")
     // Network storage: SFTP, FTP, SMB, WebDAV
     implementation(libs.jsch)
     implementation(libs.commons.net)

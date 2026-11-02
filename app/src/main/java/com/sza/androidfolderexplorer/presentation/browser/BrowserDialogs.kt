@@ -16,6 +16,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.state.ToggleableState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -435,13 +436,20 @@ private fun ArchiveBrowserDialog(path: String, vm: FileBrowserViewModel, onClose
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var password by remember { mutableStateOf("") }
-    var needPassword by remember { mutableStateOf(ArchiveTools.isEncryptedZip(archive)) }
+    var needPassword by remember { mutableStateOf(ArchiveTools.isEncrypted(archive)) }
     var entries by remember { mutableStateOf<List<ArchiveEntryInfo>?>(null) }
     var folder by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
     var status by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
+    var progress by remember { mutableStateOf<Float?>(null) }
     var loadKey by remember { mutableIntStateOf(0) }
+    // Files that will be extracted by "Extract all / Extract (N)". Starts as every file; untick to leave some out.
+    var selected by remember { mutableStateOf<Set<String>>(emptySet()) }
+    LaunchedEffect(entries) {
+        selected = entries.orEmpty().filter { !it.isDirectory }.map { it.path }.toSet()
+    }
+    val report: (Long, Long) -> Unit = { done, total -> if (total > 0) progress = (done.toFloat() / total).coerceIn(0f, 1f) }
 
     LaunchedEffect(path, loadKey, needPassword) {
         if (needPassword && password.isEmpty()) return@LaunchedEffect
@@ -453,11 +461,11 @@ private fun ArchiveBrowserDialog(path: String, vm: FileBrowserViewModel, onClose
 
     fun extractTarget() = FileOps.uniqueName(archive.parentFile!!, ArchiveExtractor.folderNameFor(archive.name))
     fun run(label: String, block: suspend () -> String) {
-        busy = true; status = "$label…"
+        busy = true; progress = null; status = "$label…"
         scope.launch {
             status = try { block() } catch (e: kotlinx.coroutines.CancellationException) { throw e }
                      catch (e: Exception) { "$label failed: ${e.message}" }
-            busy = false
+            busy = false; progress = null
         }
     }
 
@@ -467,7 +475,7 @@ private fun ArchiveBrowserDialog(path: String, vm: FileBrowserViewModel, onClose
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 if (needPassword && entries == null) {
-                    Text("This zip is password-protected.")
+                    Text("This archive is password-protected.")
                     OutlinedTextField(password, { password = it }, label = { Text("Password") }, singleLine = true,
                         visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
                     Button(onClick = { loadKey++ }, enabled = password.isNotEmpty()) { Text("Unlock") }
@@ -482,13 +490,17 @@ private fun ArchiveBrowserDialog(path: String, vm: FileBrowserViewModel, onClose
                         Text("/$folder", style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
                     }
                     val children = remember(all, folder) { ArchiveTools.childrenOf(all, folder) }
+                    val filePaths = remember(all) { all.filter { !it.isDirectory }.map { it.path } }
                     LazyColumn(Modifier.heightIn(max = 300.dp)) {
                         items(children, key = { it.path }) { e ->
                             Row(
                                 Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp))
-                                    .clickable(enabled = e.isDirectory) { folder = e.path }.padding(vertical = 6.dp),
+                                    .clickable(enabled = e.isDirectory) { folder = e.path }.padding(vertical = 2.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
+                                // Files under this row: itself for a file, everything beneath it for a folder.
+                                val under = if (e.isDirectory) filePaths.filter { it.startsWith(e.path + "/") } else listOf(e.path)
+                                val inSel = under.count { it in selected }
                                 Icon(if (e.isDirectory) Icons.Default.Folder else Icons.Default.InsertDriveFile, null,
                                     tint = MaterialTheme.colorScheme.primary)
                                 Spacer(Modifier.width(8.dp))
@@ -501,34 +513,74 @@ private fun ArchiveBrowserDialog(path: String, vm: FileBrowserViewModel, onClose
                                     run("Extract") {
                                         val dest = extractTarget()
                                         val n = ArchiveTools.extractEntry(archive, e.path, dest, password.ifEmpty { null })
-                                        vm.navigateTo(vm.uiState.value.currentPath)
-                                        "Extracted $n file(s) to ${dest.name}"
+                                        val msg = "Extracted $n file(s) to ${dest.name}"
+                                        vm.showSnackbar(msg)
+                                        vm.navigateTo(dest.absolutePath)   // open the new folder...
+                                        onClose()                          // ...and close this window
+                                        msg
                                     }
                                 }) { Icon(Icons.Default.Unarchive, "Extract ${e.path}") }
+                                // Select box on the right-hand side of the row.
+                                TriStateCheckbox(
+                                    state = when {
+                                        inSel == 0 -> ToggleableState.Off
+                                        inSel == under.size -> ToggleableState.On
+                                        else -> ToggleableState.Indeterminate
+                                    },
+                                    enabled = !busy,
+                                    onClick = {
+                                        selected = if (inSel == under.size) selected - under.toSet() else selected + under
+                                    }
+                                )
                             }
                         }
                     }
-                    Text("${all.count { !it.isDirectory }} files in archive", style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    val totalFiles = filePaths.size
+                    val selSize = remember(all, selected) { all.filter { !it.isDirectory && it.path in selected }.sumOf { it.size } }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("${selected.size} of $totalFiles files selected · ${formatSize(selSize)}",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f))
+                        TextButton(enabled = !busy, onClick = {
+                            selected = if (selected.size == totalFiles) emptySet() else filePaths.toSet()
+                        }) { Text(if (selected.size == totalFiles) "Select none" else "Select all") }
+                    }
                 }
-                if (busy) LinearProgressIndicator(Modifier.fillMaxWidth())
-                status?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary) }
+                if (busy) {
+                    val p = progress
+                    if (p != null) LinearProgressIndicator(progress = { p }, modifier = Modifier.fillMaxWidth())
+                    else LinearProgressIndicator(Modifier.fillMaxWidth())
+                }
+                status?.let {
+                    val p = progress
+                    Text(if (busy && p != null) "$it ${(p * 100).toInt()}%" else it,
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.primary)
+                }
             }
         },
         confirmButton = {
             Row {
                 TextButton(enabled = !busy, onClick = {
-                    run("Test") { ArchiveTools.test(archive, password.ifEmpty { null }).let { (if (it.ok) "✓ " else "✗ ") + it.message } }
+                    run("Test") { ArchiveTools.test(archive, password.ifEmpty { null }, report).let { (if (it.ok) "✓ " else "✗ ") + it.message } }
                 }) { Text("Test") }
-                TextButton(enabled = !busy, onClick = {
-                    run("Extract all") {
+                val totalFiles = entries.orEmpty().count { !it.isDirectory }
+                val everything = selected.size == totalFiles
+                TextButton(enabled = !busy && selected.isNotEmpty(), onClick = {
+                    run(if (everything) "Extract all" else "Extract selected") {
                         val dest = extractTarget()
-                        val n = if (needPassword) ArchiveTools.extractZipWithPassword(archive, dest, password)
-                                else ArchiveExtractor.extract(archive, dest) { }
-                        vm.navigateTo(vm.uiState.value.currentPath)
-                        "Extracted $n file(s) to ${dest.name}"
+                        val n = when {
+                            !everything -> ArchiveTools.extractPaths(archive, selected, dest, password.ifEmpty { null }, report)
+                            needPassword -> ArchiveTools.extractWithPassword(archive, dest, password, report)
+                            else -> ArchiveExtractor.extract(archive, dest, onProgress = report) { }
+                        }
+                        val msg = "Extracted $n file(s) to ${dest.name}"
+                        vm.showSnackbar(msg)
+                        vm.navigateTo(dest.absolutePath)   // open the new folder...
+                        onClose()                          // ...and close this window
+                        msg
                     }
-                }) { Text("Extract all") }
+                }) { Text(if (everything) "Extract all" else "Extract (${selected.size})") }
                 TextButton(onClick = onClose) { Text("Close") }
             }
         }

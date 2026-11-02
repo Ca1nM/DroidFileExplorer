@@ -165,6 +165,7 @@ import androidx.compose.material.icons.automirrored.filled.Sort
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
+import com.sza.androidfolderexplorer.data.formatSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
@@ -429,9 +430,33 @@ fun FileBrowserScreen(
                             else -> viewModel.toggleSelection(item.path)
                         }
                     }
+                    // Scroll to the folder we just backed out of, hold its highlight for a moment, then let it fade.
+                    val highlight = state.highlightPath
+                    LaunchedEffect(highlight, state.items) {
+                        if (highlight == null) return@LaunchedEffect
+                        val idx = state.items.indexOfFirst { it.path == highlight }
+                        if (idx >= 0) {
+                            if (state.gridView) gridState.animateScrollToItem((idx - 4).coerceAtLeast(0))
+                            else listState.animateScrollToItem((idx - 3).coerceAtLeast(0))
+                            kotlinx.coroutines.delay(2500)
+                        }
+                        viewModel.clearHighlight()
+                    }
+                    var refreshing by remember { mutableStateOf(false) }
                     PullToRefreshBox(
-                        isRefreshing = false,
-                        onRefresh = { viewModel.navigateTo(state.currentPath) },
+                        isRefreshing = refreshing,
+                        onRefresh = {
+                            scope.launch {
+                                refreshing = true
+                                try {
+                                    val reload = viewModel.refresh()
+                                    // A reload can finish within one frame; if `refreshing` flipped true->false that fast,
+                                    // the pull indicator would never be told to hide. Hold the spinner briefly.
+                                    kotlinx.coroutines.delay(700)
+                                    reload.join()
+                                } finally { refreshing = false }
+                            }
+                        },
                         modifier = Modifier.fillMaxSize()
                     ) {
                         if (state.gridView) {
@@ -442,14 +467,21 @@ fun FileBrowserScreen(
                                 contentPadding = PaddingValues(start = 8.dp, end = 36.dp, top = 4.dp, bottom = 72.dp)
                             ) {
                                 gridItems(state.items, key = { it.path }) { item ->
-                                    GridTile(
-                                        item = item,
-                                        isSelected = item.path in state.selectedPaths,
-                                        starred = item.path in user.favourites,
-                                        showThumbnails = state.showThumbnails,
-                                        onTap = { onTap(item) },
-                                        onLongPress = { selectFeedback(); viewModel.toggleSelection(item.path) }
+                                    val hl by androidx.compose.animation.animateColorAsState(
+                                        if (item.path == state.highlightPath) MaterialTheme.colorScheme.secondaryContainer
+                                        else androidx.compose.ui.graphics.Color.Transparent,
+                                        animationSpec = androidx.compose.animation.core.tween(600), label = "highlight"
                                     )
+                                    Box(Modifier.background(hl, RoundedCornerShape(12.dp))) {
+                                        GridTile(
+                                            item = item,
+                                            isSelected = item.path in state.selectedPaths,
+                                            starred = item.path in user.favourites,
+                                            showThumbnails = state.showThumbnails,
+                                            onTap = { onTap(item) },
+                                            onLongPress = { selectFeedback(); viewModel.toggleSelection(item.path) }
+                                        )
+                                    }
                                 }
                             }
                             FastScrollbar(
@@ -467,7 +499,12 @@ fun FileBrowserScreen(
                                 contentPadding = PaddingValues(bottom = 72.dp) // keep last row clear of the menu button
                             ) {
                                 items(state.items, key = { it.path }) { item ->
-                                    Box {
+                                    val hl by androidx.compose.animation.animateColorAsState(
+                                        if (item.path == state.highlightPath) MaterialTheme.colorScheme.secondaryContainer
+                                        else androidx.compose.ui.graphics.Color.Transparent,
+                                        animationSpec = androidx.compose.animation.core.tween(600), label = "highlight"
+                                    )
+                                    Box(Modifier.background(hl)) {
                                         FileItemRow(
                                             item = item,
                                             isSelected = item.path in state.selectedPaths,
@@ -1656,6 +1693,8 @@ private fun OperationDialog(
                         Text(
                             if (state.progress.totalFiles > 0) {
                                 "${state.progress.processedFiles} / ${state.progress.totalFiles} files"
+                            } else if (state.progress.totalBytes > 0) {
+                                "${(state.progress.fraction * 100).toInt()}% · ${formatSize(state.progress.processedBytes)} of ${formatSize(state.progress.totalBytes)} · ${state.progress.processedFiles} files"
                             } else {
                                 "${state.progress.processedFiles} files so far"
                             },

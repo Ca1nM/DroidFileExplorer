@@ -63,10 +63,27 @@ object ArchiveTools {
     fun isEncryptedZip(archive: File): Boolean =
         archive.name.endsWith(".zip", true) && runCatching { ZipFile(archive).isEncrypted }.getOrDefault(false)
 
-    /** Lists every entry. Works for zip, 7z and tar variants; ISO is not supported here. */
+    /** True for a password-protected zip or RAR. */
+    fun isEncrypted(archive: File): Boolean =
+        if (RarSupport.handles(archive.name)) RarSupport.isEncrypted(archive) else isEncryptedZip(archive)
+
+    /** Extracts the whole archive with a password. Zip and RAR. */
+    suspend fun extractWithPassword(
+        archive: File,
+        destDir: File,
+        password: String,
+        onProgress: (done: Long, total: Long) -> Unit = { _, _ -> }
+    ): Int =
+        if (RarSupport.handles(archive.name)) withContext(Dispatchers.IO) {
+            RarSupport.extract(archive, destDir, password, null, {}, onProgress)
+        }
+        else extractZipWithPassword(archive, destDir, password)
+
+    /** Lists every entry. Works for zip, 7z, RAR and tar variants; ISO is not supported here. */
     suspend fun list(archive: File, password: String? = null): List<ArchiveEntryInfo> = withContext(Dispatchers.IO) {
         val lower = archive.name.lowercase()
         when {
+            RarSupport.handles(archive.name) -> RarSupport.list(archive, password)
             lower.endsWith(".zip") -> zip(archive, password).fileHeaders.map {
                 ArchiveEntryInfo(it.fileName.trimEnd('/'), it.isDirectory, it.uncompressedSize)
             }
@@ -103,6 +120,25 @@ object ArchiveTools {
         return seen.values.sortedWith(compareBy({ !it.isDirectory }, { it.path.lowercase() }))
     }
 
+    /** Extracts exactly the given file paths (as listed by [list]) into [destDir]. */
+    suspend fun extractPaths(
+        archive: File,
+        paths: Set<String>,
+        destDir: File,
+        password: String? = null,
+        onProgress: (done: Long, total: Long) -> Unit = { _, _ -> }
+    ): Int =
+        if (RarSupport.handles(archive.name)) withContext(Dispatchers.IO) {
+            val fast = if (archive.name.endsWith(".7z", true) && password == null) {
+                ArchiveExtractor.tryParallelSevenZ(archive, destDir, paths, {}, onProgress)
+            } else null
+            fast ?: RarSupport.extract(archive, destDir, password, null, {}, onProgress, onlyPaths = paths)
+        } else {
+            var n = 0
+            for (p in paths) n += extractEntry(archive, p, destDir, password)
+            n
+        }
+
     /** Extracts one entry (a file, or a folder with everything under it) into [destDir]. */
     suspend fun extractEntry(archive: File, entryPath: String, destDir: File, password: String? = null): Int =
         withContext(Dispatchers.IO) {
@@ -116,6 +152,7 @@ object ArchiveTools {
                 return t
             }
             when {
+                RarSupport.handles(archive.name) -> count = RarSupport.extract(archive, destDir, password, entryPath)
                 lower.endsWith(".zip") -> {
                     val z = zip(archive, password)
                     for (h in z.fileHeaders.filter { matches(it.fileName) }) {
@@ -167,11 +204,16 @@ object ArchiveTools {
     data class TestResult(val ok: Boolean, val message: String)
 
     /** Reads every byte of every entry so CRC and format errors surface before extraction. */
-    suspend fun test(archive: File, password: String? = null): TestResult = withContext(Dispatchers.IO) {
+    suspend fun test(
+        archive: File,
+        password: String? = null,
+        onProgress: (done: Long, total: Long) -> Unit = { _, _ -> }
+    ): TestResult = withContext(Dispatchers.IO) {
         val lower = archive.name.lowercase()
         var entries = 0
         try {
             when {
+                RarSupport.handles(archive.name) -> entries = RarSupport.test(archive, password, onProgress)
                 lower.endsWith(".zip") -> {
                     val z = zip(archive, password)
                     if (!z.isValidZipFile) return@withContext TestResult(false, "Not a valid zip file")
