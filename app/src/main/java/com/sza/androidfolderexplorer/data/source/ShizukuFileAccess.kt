@@ -133,6 +133,25 @@ class ShizukuFileAccess @Inject constructor(
         -1 to (e.message ?: "Shizuku error")
     }
 
+    /**
+     * Runs [command] and feeds [input] to its stdin, so large files can be streamed to the shell
+     * (for example `pm install-write ... -`). Returns the exit code and combined output.
+     */
+    @Suppress("DEPRECATION")
+    fun execWithInput(command: String, input: java.io.InputStream): Pair<Int, String> = try {
+        val process = Shizuku.newProcess(arrayOf("sh", "-c", "$command 2>&1"), null, null)
+        // Read output on a separate thread so a full pipe can't stall the write below.
+        var output = ""
+        val reader = Thread { output = runCatching { process.inputStream.bufferedReader().readText() }.getOrDefault("") }
+        reader.start()
+        process.outputStream.use { out -> input.copyTo(out, 64 * 1024) }
+        reader.join()
+        process.waitFor() to output
+    } catch (e: Exception) {
+        Log.e(STAG, "execWithInput failed", e)
+        -1 to (e.message ?: "Shizuku error")
+    }
+
     private fun parseStat(line: String): FileItem? {
         // Format: type|size|modified_unix_seconds|fullpath. The path is last so a '|' in a name can't split it.
         val parts = line.split("|", limit = 4)

@@ -5,9 +5,14 @@ import android.net.Uri
 import android.os.Build
 import android.provider.Settings
 import androidx.activity.compose.BackHandler
+import androidx.compose.material.icons.filled.Cloud
+import androidx.compose.material.icons.filled.Storage
+import com.sza.androidfolderexplorer.data.settings.NetworkConnection
 import android.content.ClipData
 import androidx.compose.foundation.draganddrop.dragAndDropSource
 import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.material3.VerticalDivider
 import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.ui.draganddrop.DragAndDropTransferData
@@ -26,6 +31,10 @@ import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.isSecondaryPressed
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChangeIgnoreConsumed
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
@@ -136,6 +145,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Edit
@@ -188,6 +199,7 @@ fun FileBrowserScreen(
     onOpenSettings: () -> Unit = {},
     onOpenTrash: () -> Unit = {},
     onOpenTools: () -> Unit = {},
+    onOpenConnection: (String) -> Unit = {},
     viewModel: FileBrowserViewModel = hiltViewModel()
 ) {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
@@ -235,16 +247,18 @@ fun FileBrowserScreen(
         }
     }
 
-    // Back clears the selection first, then goes up one folder; at the storage root with
-    // nothing selected it falls through and leaves the app.
+    // Back clears the selection first, then goes up one folder. At the top level it opens the menu
+    // instead of leaving the app, so an over-long back swipe can't quit by accident. With the menu
+    // open, Back closes it (the sheet handles that itself).
     BackHandler(
-        enabled = (state.hasSelection || state.canGoUp || state.searchOpen) && state.editorPath == null &&
-            !state.showQuickAccess && state.dialog == null && state.viewerPaths == null
+        enabled = state.editorPath == null && !state.showQuickAccess && state.dialog == null &&
+            state.viewerPaths == null && !state.showOnboarding && !state.pendingDelete
     ) {
         when {
             state.hasSelection -> viewModel.clearSelection()
             state.searchOpen -> viewModel.toggleSearch()
-            else -> viewModel.navigateUp()
+            state.canGoUp -> viewModel.navigateUp()
+            else -> viewModel.setQuickAccessVisible(true)
         }
     }
 
@@ -515,12 +529,17 @@ fun FileBrowserScreen(
 
     if (state.showQuickAccess) {
         QuickAccessSheet(
+            connections = user.connections,
+            onOpenConnection = onOpenConnection,
             folders = state.quickFolders,
             currentPath = state.currentPath,
             showHidden = state.showHidden,
             onShowHiddenChange = { viewModel.setShowHidden(it) },
             onOpen = { path -> viewModel.navigateTo(path) },
             onRemove = { viewModel.removeQuickFolder(it) },
+            onMove = { path, delta -> viewModel.moveQuickFolder(path, delta) },
+            onEdit = { old, name, path -> viewModel.updateQuickFolder(old, name, path) },
+            onReset = { viewModel.resetQuickFolders() },
             onAdd = { viewModel.addQuickFolder(it) },
             loadSubfolders = { viewModel.listSubfolders(it) },
             onOpenSettings = onOpenSettings,
@@ -1123,12 +1142,17 @@ private fun BoxScope.QuickAccessButton(onClick: () -> Unit) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun QuickAccessSheet(
+    connections: List<NetworkConnection>,
+    onOpenConnection: (String) -> Unit,
     folders: List<QuickFolder>,
     currentPath: String,
     showHidden: Boolean,
     onShowHiddenChange: (Boolean) -> Unit,
     onOpen: (String) -> Unit,
     onRemove: (String) -> Unit,
+    onMove: (String, Int) -> Unit,
+    onEdit: (String, String, String) -> String?,
+    onReset: () -> Unit,
     onAdd: (String) -> String?,
     loadSubfolders: suspend (String) -> Result<List<FileItem>>,
     onOpenSettings: () -> Unit,
@@ -1137,12 +1161,52 @@ private fun QuickAccessSheet(
     var addText by remember(currentPath) { mutableStateOf(currentPath) }
     var addError by remember(currentPath) { mutableStateOf<String?>(null) }
     var chooserPath by remember { mutableStateOf<String?>(null) }
-    // Opens half-height showing only Quick access; pull it up to reach pinning, hidden files and settings.
-    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = false)
-    // Roughly the half-screen the sheet opens at, minus its drag handle, so the extras start below the fold.
-    val peekHeight = (LocalConfiguration.current.screenHeightDp / 2 - 56).dp
-    val scope = rememberCoroutineScope()
+    var editing by remember { mutableStateOf(false) }
+    var editTarget by remember { mutableStateOf<QuickFolder?>(null) }
+    var confirmReset by remember { mutableStateOf(false) }
+    // The sheet is only as tall as its content: a few pins make a small sheet, many pins a tall one.
+    // Pinning, hidden files and settings sit behind "More options" so they don't add empty space.
+    val density = LocalDensity.current
+    // Estimated until the list has been measured, then exact.
+    var listHeight by remember { mutableStateOf((100 + (connections.size + folders.size) * 60).dp) }
+    var listPx by remember { mutableIntStateOf(0) }
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     val sheetScroll = rememberScrollState()
+    // The sheet resizes once the list is measured; make sure it opens showing the title, not scrolled down.
+    var userScrolled by remember { mutableStateOf(false) }
+    var dragFrom by remember { mutableIntStateOf(0) }
+    LaunchedEffect(sheetScroll) {
+        sheetScroll.interactionSource.interactions.collect {
+            if (it is androidx.compose.foundation.interaction.DragInteraction.Start) {
+                userScrolled = true
+                dragFrom = sheetScroll.value
+            }
+        }
+    }
+    LaunchedEffect(listPx) { if (!userScrolled) sheetScroll.scrollTo(0) }
+    // Until the user touches the sheet it stays on the pins page, whatever the layout does while it opens.
+    LaunchedEffect(sheetScroll) {
+        androidx.compose.runtime.snapshotFlow { sheetScroll.value }.collect { v ->
+            if (!userScrolled && v != 0) sheetScroll.scrollTo(0)
+        }
+    }
+    // Two pages: the pins, and the extras below them. Letting go between the two settles on the nearer one.
+    // Once inside the extras, scrolling is free.
+    LaunchedEffect(sheetScroll) {
+        androidx.compose.runtime.snapshotFlow { sheetScroll.isScrollInProgress }.collect { moving ->
+            if (!moving && userScrolled && chooserPath == null && listPx > 0) {
+                val page = minOf(listPx, sheetScroll.maxValue)
+                val v = sheetScroll.value
+                if (page > 0 && v in 1 until page) {
+                    // Started on the pins page: past 30% of the way, go to the extras. Started on the extras: past 30% back, go to the pins.
+                    val fromExtras = dragFrom >= page / 2
+                    val target = if (fromExtras) { if (v < page * 0.7f) 0 else page } else { if (v > page * 0.3f) page else 0 }
+                    sheetScroll.animateScrollTo(target)
+                }
+            }
+        }
+    }
+    val scope = rememberCoroutineScope()
 
     // When the chooser opens, scroll the sheet so the "Pin a folder" section moves to the top.
     // Two frames are waited so the new layout has been measured before reading maxValue.
@@ -1165,6 +1229,37 @@ private fun QuickAccessSheet(
         }
     }
 
+    editTarget?.let { target ->
+        var nameText by remember(target.path) { mutableStateOf(target.name) }
+        var pathText by remember(target.path) { mutableStateOf(target.path) }
+        var err by remember(target.path) { mutableStateOf<String?>(null) }
+        AlertDialog(
+            onDismissRequest = { editTarget = null },
+            title = { Text("Edit quick access") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedTextField(nameText, { nameText = it; err = null }, label = { Text("Name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+                    OutlinedTextField(pathText, { pathText = it; err = null }, label = { Text("Folder path") }, singleLine = true, isError = err != null, modifier = Modifier.fillMaxWidth())
+                    err?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    err = onEdit(target.path, nameText, pathText)
+                    if (err == null) editTarget = null
+                }) { Text("Save") }
+            },
+            dismissButton = { TextButton(onClick = { editTarget = null }) { Text("Cancel") } }
+        )
+    }
+    if (confirmReset) AlertDialog(
+        onDismissRequest = { confirmReset = false },
+        title = { Text("Reset quick access?") },
+        text = { Text("This puts back the standard list and removes your own entries, names and order.") },
+        confirmButton = { TextButton(onClick = { confirmReset = false; onReset() }) { Text("Reset") } },
+        dismissButton = { TextButton(onClick = { confirmReset = false }) { Text("Cancel") } }
+    )
+
     ModalBottomSheet(
         onDismissRequest = onDismiss,
         sheetState = sheetState
@@ -1173,19 +1268,60 @@ private fun QuickAccessSheet(
             modifier = Modifier
                 .fillMaxWidth()
                 .navigationBarsPadding()
+                // The sheet is only as tall as the quick-access list; the extras sit below it, so pulling up scrolls them in.
+                // While the folder chooser is open the sheet may use whatever height it needs.
+                .then(if (chooserPath == null) Modifier.heightIn(max = listHeight + 24.dp) else Modifier)
                 .verticalScroll(sheetScroll)
                 .padding(horizontal = 16.dp)
                 .padding(bottom = 24.dp),
             verticalArrangement = Arrangement.spacedBy(4.dp)
         ) {
-            Column(Modifier.fillMaxWidth().heightIn(min = peekHeight), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            Text("Quick access", style = MaterialTheme.typography.titleMedium)
-            folders.forEach { folder ->
+            Column(
+                Modifier.fillMaxWidth().onSizeChanged { size ->
+                    listPx = size.height
+                    listHeight = with(density) { size.height.toDp() }
+                },
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                Text("Quick access", style = MaterialTheme.typography.titleMedium, modifier = Modifier.weight(1f))
+                if (editing) TextButton(onClick = { confirmReset = true }) { Text("Reset") }
+                TextButton(onClick = { editing = !editing }) { Text(if (editing) "Done" else "Edit") }
+            }
+            // Cloud accounts and servers saved in Tools > Network & cloud.
+            connections.forEach { conn ->
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
                         .clip(RoundedCornerShape(12.dp))
-                        .clickable { closeThen { onOpen(folder.path) } }
+                        .clickable { closeThen { onOpenConnection(conn.id) } }
+                        .padding(horizontal = 4.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        if (conn.protocol == "saf") Icons.Default.Cloud else Icons.Default.Storage,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                    Spacer(Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(conn.name.ifBlank { conn.host }, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.bodyLarge)
+                        Text(
+                            if (conn.protocol == "saf") "Cloud account" else "${conn.protocol.uppercase()} · ${conn.host}",
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+            folders.forEachIndexed { index, folder ->
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .clickable { if (editing) editTarget = folder else closeThen { onOpen(folder.path) } }
                         .padding(horizontal = 4.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -1205,18 +1341,32 @@ private fun QuickAccessSheet(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
-                    if (folder.isCustom) {
-                        IconButton(onClick = { onRemove(folder.path) }) {
+                    if (editing) {
+                        IconButton(onClick = { onMove(folder.path, -1) }, enabled = index > 0, modifier = Modifier.size(36.dp)) {
+                            Icon(Icons.Default.ArrowUpward, contentDescription = "Move ${folder.name} up")
+                        }
+                        IconButton(onClick = { onMove(folder.path, 1) }, enabled = index < folders.lastIndex, modifier = Modifier.size(36.dp)) {
+                            Icon(Icons.Default.ArrowDownward, contentDescription = "Move ${folder.name} down")
+                        }
+                        IconButton(onClick = { editTarget = folder }, modifier = Modifier.size(36.dp)) {
+                            Icon(Icons.Default.Edit, contentDescription = "Edit ${folder.name}")
+                        }
+                        IconButton(onClick = { onRemove(folder.path) }, modifier = Modifier.size(36.dp)) {
                             Icon(Icons.Default.Close, contentDescription = "Remove ${folder.name}")
                         }
                     }
                 }
             }
-            Spacer(Modifier.weight(1f, fill = false))
-            Text("Pull up for more", style = MaterialTheme.typography.labelSmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.align(Alignment.CenterHorizontally))
+            Text(
+                "Pull up for more", style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.align(Alignment.CenterHorizontally)
+                    .clickable { userScrolled = true; scope.launch { sheetScroll.animateScrollTo(listPx) } }.padding(8.dp)
+            )
             }
 
+            // At least one sheet-height tall, so the second page can scroll all the way up to start where the pins end.
+            Column(Modifier.heightIn(min = listHeight), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             HorizontalDivider(modifier = Modifier.padding(vertical = 8.dp))
 
             Text("Pin a folder", style = MaterialTheme.typography.titleMedium)
@@ -1324,6 +1474,7 @@ private fun QuickAccessSheet(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
+            }
             }
         }
     }

@@ -810,54 +810,18 @@ private fun OpenAsDialog(path: String, vm: FileBrowserViewModel, onClose: () -> 
                 Option("PDF", Icons.Default.PictureAsPdf) { vm.showDialog(BrowserDialog.Viewer(path, FileKindHint.PDF)) }
                 Option("Photo details (EXIF)", Icons.Default.Info) { vm.showDialog(BrowserDialog.Viewer(path, FileKindHint.EXIF)) }
                 Option("Audio tags", Icons.Default.MusicNote) { vm.showDialog(BrowserDialog.Viewer(path, FileKindHint.AUDIO_TAGS)) }
-                Option("Another app…", Icons.Default.OpenInNew) { onClose(); vm.openExternally(path) }
+                Option("Another app…", Icons.Default.OpenInNew) { onClose(); vm.openExternally(path, chooser = true) }
             }
         },
         confirmButton = { TextButton(onClick = onClose) { Text("Cancel") } }
     )
 }
 
-// ---- APK info ----
+// ---- APK installer ----
 
 @Composable
 private fun ApkInfoDialog(path: String, vm: FileBrowserViewModel, onClose: () -> Unit) {
-    val context = LocalContext.current
-    val pm = context.packageManager
-    val info = remember(path) {
-        runCatching {
-            pm.getPackageArchiveInfo(path, android.content.pm.PackageManager.GET_PERMISSIONS)?.also {
-                it.applicationInfo?.apply { sourceDir = path; publicSourceDir = path }
-            }
-        }.getOrNull()
-    }
-    val installed = remember(info) {
-        info?.packageName?.let { runCatching { pm.getPackageInfo(it, 0) }.getOrNull() }
-    }
-    InfoDialog(File(path).name, onClose) {
-        if (info == null) {
-            Text("This file isn't a valid APK, or it's a split bundle (.apks/.xapk).")
-        } else {
-            val label = info.applicationInfo?.loadLabel(pm)?.toString() ?: "?"
-            KeyValue("App", label)
-            KeyValue("Package", info.packageName ?: "?", mono = true)
-            @Suppress("DEPRECATION")
-            KeyValue("Version", "${info.versionName} (${info.longVersionCode})")
-            info.applicationInfo?.let { KeyValue("Min / target SDK", "${it.minSdkVersion} / ${it.targetSdkVersion}") }
-            KeyValue("Size", formatSize(File(path).length()))
-            installed?.let { KeyValue("Installed version", "${it.versionName} (${it.longVersionCode})") }
-                ?: KeyValue("Installed", "No")
-            val perms = info.requestedPermissions?.toList().orEmpty()
-            KeyValue("Permissions (${perms.size})", perms.joinToString("\n") { it.removePrefix("android.permission.") }.ifEmpty { "None" })
-            Button(onClick = {
-                if (!pm.canRequestPackageInstalls()) {
-                    context.startActivity(Intent(Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES, Uri.parse("package:${context.packageName}"))
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
-                } else {
-                    vm.openExternally(path, "application/vnd.android.package-archive")
-                }
-            }) { Text(if (installed != null) "Update / reinstall" else "Install") }
-        }
-    }
+    com.sza.androidfolderexplorer.presentation.install.InstallerDialog(path, onClose)
 }
 
 // ---- Recursive search ----

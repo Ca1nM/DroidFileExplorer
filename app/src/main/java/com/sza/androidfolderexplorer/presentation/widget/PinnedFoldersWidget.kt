@@ -18,6 +18,10 @@ private val DEFAULT_FOLDERS = listOf("Download", "DCIM", "Pictures", "Music", "M
 /** Every pinned folder: the built-in quick-access ones, then the user's own. */
 internal fun pinnedFolders(context: Context): List<String> {
     val prefs = context.getSharedPreferences(AppSettings.PREFS, Context.MODE_PRIVATE)
+    // The list as edited in the app (name<TAB>path per line); older installs fall back to the built-ins plus pinned folders.
+    prefs.getString("quick_access_v2", null)?.let { raw ->
+        return raw.split('\n').mapNotNull { l -> l.substringAfter('\t', "").takeIf { it.startsWith("/") } }.distinct()
+    }
     val custom = prefs.getString("quick_access_custom", "").orEmpty().split('\n').filter { it.isNotBlank() }
     return (listOf(STORAGE_ROOT) + DEFAULT_FOLDERS.map { "$STORAGE_ROOT/$it" } + custom).distinct()
 }

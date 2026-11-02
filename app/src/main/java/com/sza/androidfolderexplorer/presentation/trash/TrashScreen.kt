@@ -110,8 +110,10 @@ fun TrashScreen(onBack: () -> Unit, viewModel: TrashViewModel = hiltViewModel())
                         .padding(horizontal = 16.dp, vertical = 10.dp),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Checkbox(e.id in selected, { selected = if (it) selected + e.id else selected - e.id })
-                    Spacer(Modifier.width(8.dp))
+                    IconButton(onClick = { viewModel.restore(listOf(e)) }) {
+                        Icon(Icons.Default.Restore, contentDescription = "Restore ${e.name}", tint = MaterialTheme.colorScheme.primary)
+                    }
+                    Spacer(Modifier.width(4.dp))
                     Icon(if (e.isDirectory) Icons.Default.Folder else Icons.Default.InsertDriveFile, null, tint = MaterialTheme.colorScheme.primary)
                     Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
@@ -123,9 +125,7 @@ fun TrashScreen(onBack: () -> Unit, viewModel: TrashViewModel = hiltViewModel())
                             maxLines = 1, overflow = TextOverflow.Ellipsis
                         )
                     }
-                    IconButton(onClick = { viewModel.restore(listOf(e)) }) {
-                        Icon(Icons.Default.Restore, contentDescription = "Restore ${e.name}", tint = MaterialTheme.colorScheme.primary)
-                    }
+                    Checkbox(e.id in selected, { selected = if (it) selected + e.id else selected - e.id })
                 }
             }
         }

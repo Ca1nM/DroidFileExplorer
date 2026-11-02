@@ -60,7 +60,12 @@ fun AppNavigation() {
             FileBrowserScreen(
                 onOpenSettings = { navController.navigate(SettingsRoute) },
                 onOpenTrash = { navController.navigate(TrashRoute) },
-                onOpenTools = { navController.navigate(ToolsRoute) }
+                onOpenTools = { navController.navigate(ToolsRoute) },
+                onOpenConnection = { id ->
+                    // The Network screen picks this up and connects straight away.
+                    com.sza.androidfolderexplorer.data.network.NetworkRequests.connect(id)
+                    navController.navigate(NetworkRoute)
+                }
             )
         }
         composable<SettingsRoute> {

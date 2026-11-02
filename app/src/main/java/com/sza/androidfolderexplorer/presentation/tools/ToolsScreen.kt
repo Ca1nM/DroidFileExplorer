@@ -41,6 +41,11 @@ import com.sza.androidfolderexplorer.data.settings.AppSettings
 import com.sza.androidfolderexplorer.data.settings.UserData
 import com.sza.androidfolderexplorer.data.source.FileOps
 import com.sza.androidfolderexplorer.data.source.TrashManager
+import com.sza.androidfolderexplorer.data.source.ShizukuFileAccess
+import com.sza.androidfolderexplorer.data.storage.AppUsage
+import com.sza.androidfolderexplorer.data.storage.StorageBreakdown
+import androidx.lifecycle.compose.LifecycleEventEffect
+import androidx.lifecycle.Lifecycle
 import com.sza.androidfolderexplorer.domain.model.FileItem
 import com.sza.androidfolderexplorer.domain.usecase.DeleteFilesUseCase
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -68,12 +73,18 @@ data class InstalledApp(val label: String, val pkg: String, val version: String,
 data class CleanupItem(val path: String, val label: String, val size: Long, val kind: String, val permanent: Boolean = false)
 data class OverviewResult(
     val byCategory: Map<String, Long>, val largest: List<FileItem>,
-    val files: Int, val totalBytes: Long, val freeBytes: Long, val usedBytes: Long
+    val files: Int, val totalBytes: Long, val freeBytes: Long, val usedBytes: Long,
+    /** Bytes per file extension inside the "Other" category, so "Other" can be explained. */
+    val otherExts: Map<String, Long> = emptyMap()
 )
 
 /** One folder's direct contents as last scanned. Reused while the folder's modified time is unchanged. */
 @Serializable
-data class DirScan(val mtime: Long, val subdirs: List<String>, val cats: Map<String, Long>, val files: Int, val top: List<TopFile>)
+data class DirScan(
+    val mtime: Long, val subdirs: List<String>, val cats: Map<String, Long>, val files: Int, val top: List<TopFile>,
+    /** Extension -> bytes for files in the "Other" category. Null in scans saved before this existed. */
+    val exts: Map<String, Long>? = null
+)
 
 @Serializable
 data class TopFile(val name: String, val size: Long, val modified: Long)
@@ -88,7 +99,8 @@ class ToolsViewModel @Inject constructor(
     val trash: TrashManager,
     private val settings: AppSettings,
     private val userData: UserData,
-    private val deleteFiles: DeleteFilesUseCase
+    private val deleteFiles: DeleteFilesUseCase,
+    private val shizuku: ShizukuFileAccess
 ) : ViewModel() {
 
     var busy by mutableStateOf(false); private set
@@ -97,6 +109,62 @@ class ToolsViewModel @Inject constructor(
     var overview by mutableStateOf<OverviewResult?>(null); private set
     var overviewScannedAt by mutableLongStateOf(0L); private set
     var overviewReused by mutableIntStateOf(0); private set
+    /** Per-app sizes from Android's storage statistics; empty until usage access is granted. */
+    var appUsage by mutableStateOf<List<AppUsage>?>(null); private set
+    var usageAccess by mutableStateOf(false); private set
+    val shizukuReady: Boolean get() = shizuku.hasPermission()
+
+    /** What the overview is showing inside (a file type or the app list); null shows the overview itself. */
+    var detail by mutableStateOf<OverviewDetail?>(null); private set
+    var detailFiles by mutableStateOf<List<FileItem>?>(null); private set
+    /** Set when files were deleted, so the overview is refreshed when the detail page closes. */
+    private var overviewStale = false
+
+    fun openApps(sort: AppSort) { detail = OverviewDetail.Apps(sort) }
+
+    fun closeDetail() {
+        job?.cancel(); busy = false
+        detail = null; detailFiles = null
+        if (overviewStale) { overviewStale = false; scanOverview() }
+    }
+
+    /** Lists every file of one type, looking only in the folders the last scan found them in. */
+    fun openCategory(name: String) {
+        detail = OverviewDetail.Files(name); detailFiles = null
+        run("Listing $name files") {
+            val folders = loadOverviewCache().dirs.filter { (it.value.cats[name] ?: 0L) > 0L }.keys
+            val found = ArrayList<FileItem>()
+            for (dir in folders) {
+                currentCoroutineContext().ensureActive()
+                runCatching { fileOps.list(dir) }.getOrNull()?.forEach {
+                    if (!it.isDirectory && FileTypes.categoryOf(it.name) == name) found += it
+                }
+                if (found.size >= 20_000) break
+            }
+            detailFiles = found.sortedByDescending { it.size }
+        }
+    }
+
+    /** Moves files to the trash. The space comes back when the trash is emptied. */
+    fun trashFiles(items: List<FileItem>) = run("Moving to trash") {
+        val (added, failed) = trash.trash(items.map { it.path })
+        val gone = added.map { it.originalPath }.toSet()
+        detailFiles = detailFiles?.filter { it.path !in gone }
+        overviewStale = overviewStale || gone.isNotEmpty()
+        message = "Moved ${added.size} file(s) to the trash (${formatSize(items.filter { it.path in gone }.sumOf { it.size })}); " +
+            "empty the trash to free the space" + if (failed.isNotEmpty()) ". ${failed.size} couldn't be moved." else "."
+    }
+
+    /** Deletes files immediately and for good. */
+    fun deleteFilesForever(items: List<FileItem>) = run("Deleting") {
+        deleteFiles(items.map { it.path })
+        val gone = items.filter { !java.io.File(it.path).exists() }
+        val goneSet = gone.map { it.path }.toSet()
+        detailFiles = detailFiles?.filter { it.path !in goneSet }
+        overviewStale = overviewStale || gone.isNotEmpty()
+        message = "Deleted ${gone.size} file(s), freed ${formatSize(gone.sumOf { it.size })}" +
+            if (gone.size < items.size) ". ${items.size - gone.size} couldn't be deleted." else "."
+    }
     private val overviewFile get() = File(context.filesDir, "overview_cache.json")
     private val cacheJson = Json { ignoreUnknownKeys = true }
     var duplicates by mutableStateOf<List<List<FileItem>>?>(null); private set
@@ -124,17 +192,19 @@ class ToolsViewModel @Inject constructor(
     private suspend fun buildOverview(dirs: Map<String, DirScan>, scan: (suspend (String) -> DirScan?)?, out: MutableMap<String, DirScan>): OverviewResult {
         val cats = HashMap<String, Long>()
         val candidates = ArrayList<FileItem>()
+        val otherExts = HashMap<String, Long>()
         var count = 0; var reused = 0
         suspend fun visit(path: String) {
             currentCoroutineContext().ensureActive()
             val cached = dirs[path]
             val live = if (scan != null) {
                 val mtime = File(path).lastModified()
-                if (cached != null && mtime > 0 && cached.mtime == mtime) { reused++; cached } else scan(path)
+                if (cached != null && cached.exts != null && mtime > 0 && cached.mtime == mtime) { reused++; cached } else scan(path)
             } else cached
             val entry = live ?: return
             out[path] = entry
             entry.cats.forEach { (k, v) -> cats.merge(k, v, Long::plus) }
+            entry.exts?.forEach { (k, v) -> otherExts.merge(k, v, Long::plus) }
             count += entry.files
             entry.top.forEach { candidates += FileItem(it.name, "$path/${it.name}", false, it.size, it.modified) }
             if (candidates.size > 400) { candidates.sortByDescending { it.size }; while (candidates.size > 40) candidates.removeAt(candidates.lastIndex) }
@@ -145,7 +215,7 @@ class ToolsViewModel @Inject constructor(
         overviewReused = reused
         candidates.sortByDescending { it.size }
         val stat = StatFs(Environment.getExternalStorageDirectory().path)
-        return OverviewResult(cats, candidates.take(40), count, cats.values.sum(), stat.availableBytes, stat.totalBytes - stat.availableBytes)
+        return OverviewResult(cats, candidates.take(40), count, cats.values.sum(), stat.availableBytes, stat.totalBytes - stat.availableBytes, otherExts)
     }
 
     /** Shows the last saved scan without touching the file system. Returns false if there is none yet. */
@@ -155,6 +225,7 @@ class ToolsViewModel @Inject constructor(
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) { buildOverview(cache.dirs, null, HashMap()) }
             overview = result; overviewScannedAt = cache.scannedAt; overviewReused = 0
+            withContext(Dispatchers.IO) { loadAppUsage() }
         }
         return true
     }
@@ -172,18 +243,47 @@ class ToolsViewModel @Inject constructor(
                 val items = fileOps.list(path)
                 val files = items.filter { !it.isDirectory }
                 val cats = HashMap<String, Long>()
-                files.forEach { cats.merge(FileTypes.categoryOf(it.name), it.size, Long::plus) }
+                val exts = HashMap<String, Long>()
+                files.forEach {
+                    val cat = FileTypes.categoryOf(it.name)
+                    cats.merge(cat, it.size, Long::plus)
+                    if (cat == "Other") exts.merge(FileTypes.ext(it.name), it.size, Long::plus)
+                }
                 DirScan(
                     mtime = File(path).lastModified(),
                     subdirs = items.filter { it.isDirectory && !fileOps.isRestricted(it.path) && it.path != TrashManager.TRASH_DIR }.map { it.name },
                     cats = cats, files = files.size,
-                    top = files.sortedByDescending { it.size }.take(40).map { TopFile(it.name, it.size, it.lastModified) }
+                    top = files.sortedByDescending { it.size }.take(40).map { TopFile(it.name, it.size, it.lastModified) },
+                    exts = exts
                 )
             }.getOrNull()
         }, fresh)
         val now = System.currentTimeMillis()
         runCatching { overviewFile.writeText(cacheJson.encodeToString(OverviewCache(fresh, now))) }
         overview = result; overviewScannedAt = now
+        loadAppUsage()
+    }
+
+    /** Reads per-app sizes if usage access is granted. */
+    private fun loadAppUsage() {
+        usageAccess = StorageBreakdown.hasUsageAccess(context)
+        appUsage = if (usageAccess) StorageBreakdown.queryApps(context) else null
+    }
+
+    /** Re-checks usage access, for example after coming back from Android's settings. */
+    fun refreshUsageAccess() {
+        val before = usageAccess
+        viewModelScope.launch(Dispatchers.IO) {
+            loadAppUsage()
+            if (!before && usageAccess) progress = ""
+        }
+    }
+
+    fun grantUsageAccess() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val ok = StorageBreakdown.grantWithShizuku(context, shizuku)
+            if (ok) loadAppUsage() else message = "Couldn't grant usage access. Allow it in Android's settings instead."
+        }
     }
 
     fun scanDuplicates() = run("Looking for duplicates") {
@@ -310,18 +410,28 @@ fun ToolsScreen(
     LaunchedEffect(viewModel.message) { viewModel.message?.let { snack.showSnackbar(it); viewModel.message = null } }
     val restorePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri -> if (uri != null) viewModel.restore(uri) }
 
-    androidx.activity.compose.BackHandler(enabled = page != Page.HOME) { viewModel.cancel(); page = Page.HOME }
+    LifecycleEventEffect(Lifecycle.Event.ON_RESUME) { if (page == Page.OVERVIEW) viewModel.refreshUsageAccess() }
+    androidx.activity.compose.BackHandler(enabled = page != Page.HOME) {
+        // Inside a file type or the app list, Back returns to the overview first.
+        if (viewModel.detail != null) viewModel.closeDetail() else { viewModel.cancel(); page = Page.HOME }
+    }
 
     Scaffold(
         snackbarHost = { SnackbarHost(snack) },
         topBar = {
             TopAppBar(
                 title = { Text(when (page) {
-                    Page.HOME -> "Tools"; Page.OVERVIEW -> "Storage overview"; Page.DUPES -> "Duplicate finder"
+                    Page.HOME -> "Tools"; Page.OVERVIEW -> viewModel.detail?.title ?: "Storage overview"; Page.DUPES -> "Duplicate finder"
                     Page.CLEANUP -> "Cleanup"; Page.APPS -> "Installed apps"; Page.DIAG -> "Diagnostics"
                 }) },
                 navigationIcon = {
-                    IconButton(onClick = { if (page == Page.HOME) onBack() else { viewModel.cancel(); page = Page.HOME } }) {
+                    IconButton(onClick = {
+                        when {
+                            page == Page.HOME -> onBack()
+                            viewModel.detail != null -> viewModel.closeDetail()
+                            else -> { viewModel.cancel(); page = Page.HOME }
+                        }
+                    }) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
                     }
                 }
@@ -353,7 +463,11 @@ fun ToolsScreen(
                     ToolRow(Icons.Default.Restore, "Restore settings", "From a backup file") { restorePicker.launch(arrayOf("application/json", "*/*")) }
                     ToolRow(Icons.Default.BugReport, "Diagnostics", "Crashes, slow folder loads, export a bug report") { page = Page.DIAG }
                 }
-                Page.OVERVIEW -> OverviewPage(viewModel, onReveal)
+                Page.OVERVIEW -> when (val d = viewModel.detail) {
+                    null -> StorageOverviewPage(viewModel, onReveal)
+                    is OverviewDetail.Files -> FilesDetailPage(d.category, viewModel, onReveal)
+                    is OverviewDetail.Apps -> AppsDetailPage(d.sort, viewModel, onReveal)
+                }
                 Page.DUPES -> DuplicatesPage(viewModel)
                 Page.CLEANUP -> CleanupPage(viewModel)
                 Page.APPS -> AppsPage(viewModel)
@@ -369,59 +483,6 @@ private fun ToolRow(icon: androidx.compose.ui.graphics.vector.ImageVector, title
         Icon(icon, null, tint = MaterialTheme.colorScheme.primary)
         Spacer(Modifier.width(16.dp))
         Column(Modifier.weight(1f)) { Text(title, style = MaterialTheme.typography.bodyLarge); Text(sub, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-    }
-}
-
-@Composable
-private fun OverviewPage(vm: ToolsViewModel, onReveal: () -> Unit) {
-    val o = vm.overview
-    if (o == null) { if (!vm.busy) Text("No data yet.", Modifier.padding(16.dp)); return }
-    LazyColumn(contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        item {
-            val ago = if (vm.overviewScannedAt > 0) android.text.format.DateUtils.getRelativeTimeSpanString(vm.overviewScannedAt, System.currentTimeMillis(), android.text.format.DateUtils.MINUTE_IN_MILLIS) else "never"
-            Text("Last scanned $ago" + if (vm.overviewReused > 0) " \u00b7 ${vm.overviewReused} unchanged folders reused" else "", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(onClick = { vm.scanOverview() }, enabled = !vm.busy) { Text("Refresh") }
-                OutlinedButton(onClick = { vm.scanOverview(full = true) }, enabled = !vm.busy) { Text("Full rescan") }
-            }
-        }
-        item {
-            val total = o.usedBytes + o.freeBytes
-            Text("${formatSize(o.usedBytes)} used of ${formatSize(total)}", style = MaterialTheme.typography.titleMedium)
-            Text("${formatSize(o.freeBytes)} free · ${o.files} files scanned (${formatSize(o.totalBytes)} visible to this app)", style = MaterialTheme.typography.bodySmall)
-            Spacer(Modifier.height(8.dp))
-            Row(Modifier.fillMaxWidth().height(14.dp).clip(RoundedCornerShape(7.dp)).background(MaterialTheme.colorScheme.surfaceVariant)) {
-                o.byCategory.entries.sortedByDescending { it.value }.forEachIndexed { i, (_, bytes) ->
-                    if (bytes > 0) Box(Modifier.weight((bytes.toFloat() / total).coerceAtLeast(0.002f)).fillMaxHeight().background(categoryColor(i)))
-                }
-                Spacer(Modifier.weight((o.freeBytes.toFloat() / total).coerceAtLeast(0.001f)))
-            }
-        }
-        itemsIndexedCats(o)
-        item { Text("Largest files", style = MaterialTheme.typography.titleMedium, modifier = Modifier.padding(top = 12.dp)) }
-        items(o.largest, key = { it.path }) { f ->
-            Row(Modifier.fillMaxWidth().clickable { OpenRequests.request(f.path.substringBeforeLast('/')); onReveal() }.padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                Column(Modifier.weight(1f)) {
-                    Text(f.name, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                    Text(f.path.removePrefix(ROOT).substringBeforeLast('/'), maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
-                Text(formatSize(f.size), style = MaterialTheme.typography.labelLarge)
-            }
-        }
-    }
-}
-
-private fun categoryColor(i: Int) = listOf(0xFF1E88E5, 0xFF43A047, 0xFFFB8C00, 0xFF8E24AA, 0xFFE53935, 0xFF00ACC1, 0xFF6D4C41).let { androidx.compose.ui.graphics.Color(it[i % it.size]) }
-
-private fun androidx.compose.foundation.lazy.LazyListScope.itemsIndexedCats(o: OverviewResult) {
-    val sorted = o.byCategory.entries.sortedByDescending { it.value }
-    items(sorted.size) { i ->
-        val (name, bytes) = sorted[i].let { it.key to it.value }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(12.dp).clip(RoundedCornerShape(3.dp)).background(categoryColor(i)))
-            Spacer(Modifier.width(8.dp))
-            Text(name, Modifier.weight(1f)); Text(formatSize(bytes))
-        }
     }
 }
 

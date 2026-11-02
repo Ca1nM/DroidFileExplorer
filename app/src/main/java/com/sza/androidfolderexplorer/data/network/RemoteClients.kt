@@ -41,7 +41,8 @@ data class RemoteItem(
     val path: String,
     val isDirectory: Boolean,
     val size: Long,
-    val modified: Long
+    val modified: Long,
+    val mime: String? = null
 )
 
 /** One remote storage. All calls block, so run them off the main thread. */
@@ -325,21 +326,40 @@ private class SafClient(private val context: Context, private val tree: Uri) : R
     private val cr = context.contentResolver
     override val rootPath: String = DocumentsContract.getTreeDocumentId(tree)
 
+    /**
+     * Cloud providers such as Google Drive often answer a folder request straight away with an empty
+     * "still loading" result and fill it in a moment later. Asking again until the provider says it is
+     * done is what makes folders show their contents instead of looking empty.
+     */
     override fun list(path: String): List<RemoteItem> {
         val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, path)
-        val out = mutableListOf<RemoteItem>()
-        cr.query(
-            children,
-            arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.COLUMN_SIZE, DocumentsContract.Document.COLUMN_LAST_MODIFIED),
-            null, null, null
-        )?.use { c ->
-            while (c.moveToNext()) {
-                out += RemoteItem(c.getString(1) ?: "?", c.getString(0), c.getString(2) == DocumentsContract.Document.MIME_TYPE_DIR,
-                    if (c.isNull(3)) 0L else c.getLong(3), if (c.isNull(4)) 0L else c.getLong(4))
+        val projection = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE, DocumentsContract.Document.COLUMN_SIZE, DocumentsContract.Document.COLUMN_LAST_MODIFIED
+        )
+        val deadline = System.currentTimeMillis() + 60_000
+        var emptyRetries = 0
+        while (true) {
+            val out = mutableListOf<RemoteItem>()
+            var loading = false
+            var error: String? = null
+            cr.query(children, projection, null, null, null)?.use { c ->
+                val extras = c.extras
+                loading = extras?.getBoolean(DocumentsContract.EXTRA_LOADING, false) == true
+                error = extras?.getString(DocumentsContract.EXTRA_ERROR)
+                while (c.moveToNext()) {
+                    out += RemoteItem(c.getString(1) ?: "?", c.getString(0), c.getString(2) == DocumentsContract.Document.MIME_TYPE_DIR,
+                        if (c.isNull(3)) 0L else c.getLong(3), if (c.isNull(4)) 0L else c.getLong(4), c.getString(2))
+                }
             }
+            if (!loading) error?.let { throw IOException(it) }
+            val timedOut = System.currentTimeMillis() > deadline
+            // A provider that doesn't flag "loading" can still hand back an empty first answer; look once or twice more.
+            val settled = !loading && (out.isNotEmpty() || emptyRetries >= 2)
+            if (settled || timedOut) return out.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+            if (!loading) emptyRetries++
+            Thread.sleep(700)
         }
-        return out.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
     }
 
     private fun docUri(id: String) = DocumentsContract.buildDocumentUriUsingTree(tree, id)

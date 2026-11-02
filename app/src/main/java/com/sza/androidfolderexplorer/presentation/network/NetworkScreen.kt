@@ -4,11 +4,13 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Environment
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -28,7 +30,12 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewModelScope
+import com.sza.androidfolderexplorer.data.FileKind
+import com.sza.androidfolderexplorer.data.FileTypes
 import com.sza.androidfolderexplorer.data.SecretBox
+import com.sza.androidfolderexplorer.presentation.browser.SharedClipboard
+import com.sza.androidfolderexplorer.data.network.CloudNames
+import com.sza.androidfolderexplorer.data.network.NetworkRequests
 import com.sza.androidfolderexplorer.data.formatSize
 import com.sza.androidfolderexplorer.data.network.HostKeyStore
 import com.sza.androidfolderexplorer.data.network.RemoteClient
@@ -58,23 +65,76 @@ class NetworkViewModel @Inject constructor(
     private var client: RemoteClient? = null
     private var job: Job? = null
 
+    /** One step of the path from the account root down to the folder on screen. */
+    data class Crumb(val path: String, val name: String)
+
     var active by mutableStateOf<NetworkConnection?>(null); private set
-    var path by mutableStateOf("/"); private set
+    var crumbs by mutableStateOf<List<Crumb>>(emptyList()); private set
+    /** The folder on screen: a path for servers, a document id for cloud accounts. */
+    val path: String get() = crumbs.lastOrNull()?.path ?: "/"
     var items by mutableStateOf<List<RemoteItem>>(emptyList()); private set
     var busy by mutableStateOf(false); private set
     var status by mutableStateOf("")
     var message by mutableStateOf<String?>(null)
     var lastDownload by mutableStateOf<File?>(null)
+    /** The last failure, kept on screen until dismissed (the snackbar message disappears after a few seconds). */
+    var error by mutableStateOf<String?>(null)
+
+    init {
+        // Older versions saved cloud accounts under the provider's raw id; give them readable names.
+        viewModelScope.launch(Dispatchers.IO) {
+            userData.state.value.connections.filter { it.protocol == "saf" && CloudNames.looksRaw(it.name) }.forEach { c ->
+                val fixed = CloudNames.describe(context, Uri.parse(c.host))
+                userData.update { s -> s.copy(connections = s.connections.map { if (it.id == c.id) it.copy(name = fixed) else it }) }
+            }
+        }
+        // Open an account chosen from the hamburger menu.
+        viewModelScope.launch {
+            NetworkRequests.pending.collect { id ->
+                if (id != null) {
+                    val conn = userData.state.value.connections.firstOrNull { it.id == id }
+                    com.sza.androidfolderexplorer.data.diag.Diagnostics.log("network", "open request $id found=${conn != null}")
+                    conn?.let { connect(it) }
+                    NetworkRequests.consume()
+                }
+            }
+        }
+    }
+
+    /** Remembers a cloud account picked in the system file picker. */
+    fun addProvider(uri: Uri) {
+        context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        viewModelScope.launch(Dispatchers.IO) {
+            val name = CloudNames.describe(context, uri)
+            userData.update { s ->
+                // Picking the same account again shouldn't add a duplicate.
+                if (s.connections.any { it.protocol == "saf" && it.host == uri.toString() }) s
+                else s.copy(connections = s.connections + NetworkConnection(java.util.UUID.randomUUID().toString(), name, "saf", uri.toString(), 0))
+            }
+        }
+    }
 
     private val downloadDir get() = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "Network")
 
+    /** Runs blocking work (network, disk) off the main thread. */
+    private suspend fun <T> io(f: () -> T): T = withContext(Dispatchers.IO) { f() }
+
+    /**
+     * Runs [block] on the main thread; it moves slow work into [io] itself. Screen state is only ever
+     * written here, on the main thread. Writing it from a background thread while the screen was still
+     * being built could be missed, which left the account list showing after a successful connection.
+     */
     private fun launch(label: String, block: suspend () -> Unit) {
         job?.cancel()
-        busy = true; status = label
+        busy = true; status = label; error = null
         job = viewModelScope.launch {
-            try { withContext(Dispatchers.IO) { block() } }
+            try { block() }
             catch (e: CancellationException) { throw e }
-            catch (e: Throwable) { message = "$label: ${e.message ?: e.javaClass.simpleName}" }
+            catch (e: Throwable) {
+                message = "$label: ${e.message ?: e.javaClass.simpleName}"
+                error = message
+                com.sza.androidfolderexplorer.data.diag.Diagnostics.log("network", "$label failed: ${e.stackTraceToString().take(800)}")
+            }
             busy = false
         }
     }
@@ -87,36 +147,77 @@ class NetworkViewModel @Inject constructor(
 
     fun delete(conn: NetworkConnection) = userData.update { s -> s.copy(connections = s.connections - conn) }
 
-    fun connect(conn: NetworkConnection) = launch("Connecting to ${conn.name}") {
-        val c = RemoteClients.open(context, conn, hostKeys)
+    /** The account or server last tapped, so Retry can try it again. */
+    var lastAttempt: NetworkConnection? = null
+
+    /** For each cloud account, the name of the folder it was granted (Android only shares the folder you pick). */
+    var shownFolders by mutableStateOf<Map<String, String>>(emptyMap()); private set
+
+    init {
+        viewModelScope.launch {
+            val names = io {
+                userData.state.value.connections.filter { it.protocol == "saf" }.mapNotNull { c ->
+                    val tree = Uri.parse(c.host)
+                    val name = runCatching {
+                        context.contentResolver.query(
+                            DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree)),
+                            arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME), null, null, null
+                        )?.use { if (it.moveToFirst()) it.getString(0) else null }
+                    }.getOrNull()
+                    name?.let { c.id to it }
+                }.toMap()
+            }
+            shownFolders = names
+        }
+    }
+
+    fun connect(conn: NetworkConnection) { lastAttempt = conn; connectNow(conn) }
+
+    private fun connectNow(conn: NetworkConnection) = launch("Connecting to ${conn.name}") {
+        val c = io { RemoteClients.open(context, conn, hostKeys) }
         client?.close(); client = c
+        // Switch to the account's view straight away; Drive can take a moment to load its folders.
         active = conn
-        path = c.rootPath
-        items = c.list(path).sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+        crumbs = listOf(Crumb(c.rootPath, conn.name))
+        items = emptyList()
+        status = "Loading ${conn.name}…"
+        items = io { sorted(c.list(c.rootPath)) }
     }
 
-    fun open(p: String) = launch("Loading") {
+    private fun sorted(list: List<RemoteItem>) = list.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+
+    /** Opens [folder] and adds it to the path. */
+    fun openFolder(folder: RemoteItem) = launch("Loading ${folder.name}") {
         val c = client ?: return@launch
-        val list = c.list(p).sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
-        path = p; items = list
+        val list = io { sorted(c.list(folder.path)) }
+        crumbs = crumbs + Crumb(folder.path, folder.name); items = list
     }
 
+    /** Jumps back to an earlier folder in the path. */
+    fun openCrumb(index: Int) = launch("Loading") {
+        val c = client ?: return@launch
+        val target = crumbs.getOrNull(index) ?: return@launch
+        val list = io { sorted(c.list(target.path)) }
+        crumbs = crumbs.take(index + 1); items = list
+    }
+
+    /** One folder up. False at the account root, where Back should leave the account. */
     fun up(): Boolean {
-        val conn = active ?: return false
-        if (conn.protocol == "saf") return false // document ids are opaque; leave through the back button
-        val parent = path.trimEnd('/').substringBeforeLast('/', "")
-        if (path.trimEnd('/').isEmpty() || path == client?.rootPath) return false
-        open(parent.ifEmpty { "/" }); return true
+        if (crumbs.size <= 1) return false
+        openCrumb(crumbs.size - 2); return true
     }
 
-    fun disconnect() { job?.cancel(); client?.close(); client = null; active = null; items = emptyList(); busy = false }
+    fun disconnect() { job?.cancel(); client?.close(); client = null; active = null; crumbs = emptyList(); items = emptyList(); busy = false }
 
     fun download(item: RemoteItem) = launch("Downloading ${item.name}") {
         val c = client ?: return@launch
-        downloadDir.mkdirs()
-        val target = FileOps.uniqueName(downloadDir, item.name)
-        try { target.outputStream().buffered().use { c.download(item, it) } }
-        catch (e: Throwable) { target.delete(); throw e }
+        val target = io {
+            downloadDir.mkdirs()
+            val t = FileOps.uniqueName(downloadDir, item.name)
+            try { t.outputStream().buffered().use { c.download(item, it) } }
+            catch (e: Throwable) { t.delete(); throw e }
+            t
+        }
         lastDownload = target
         message = "Saved to Download/Network/${target.name}"
     }
@@ -124,36 +225,73 @@ class NetworkViewModel @Inject constructor(
     fun upload(uris: List<Uri>) = launch("Uploading") {
         val c = client ?: return@launch
         var n = 0
+        val dir = path
         for (u in uris) {
-            var name = u.lastPathSegment?.substringAfterLast('/') ?: "file"
-            var size = -1L
-            context.contentResolver.query(u, null, null, null, null)?.use { q ->
-                if (q.moveToFirst()) {
-                    q.getColumnIndex(OpenableColumns.DISPLAY_NAME).takeIf { it >= 0 }?.let { name = q.getString(it) }
-                    q.getColumnIndex(OpenableColumns.SIZE).takeIf { it >= 0 }?.let { size = q.getLong(it) }
+            val (name, size) = io {
+                var nm = u.lastPathSegment?.substringAfterLast('/') ?: "file"
+                var sz = -1L
+                context.contentResolver.query(u, null, null, null, null)?.use { q ->
+                    if (q.moveToFirst()) {
+                        q.getColumnIndex(OpenableColumns.DISPLAY_NAME).takeIf { it >= 0 }?.let { nm = q.getString(it) }
+                        q.getColumnIndex(OpenableColumns.SIZE).takeIf { it >= 0 }?.let { sz = q.getLong(it) }
+                    }
                 }
+                nm to sz
             }
             status = "Uploading $name"
-            (context.contentResolver.openInputStream(u) ?: error("Can't read $name")).use { c.upload(path, name, it, size) }
+            io { (context.contentResolver.openInputStream(u) ?: error("Can't read $name")).use { c.upload(dir, name, it, size) } }
             n++
         }
-        items = c.list(path).sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+        items = io { sorted(c.list(dir)) }
         message = "Uploaded $n file(s)"
     }
 
+    /** Copies what was copied or cut in the file browser into the folder on screen; a cut removes the originals afterwards. */
+    fun pasteClipboard() = launch("Copying here") {
+        val c = client ?: return@launch
+        val clip = SharedClipboard.state.value ?: return@launch
+        val dir = path
+        var n = 0
+        for (p in clip.paths) {
+            val f = File(p)
+            status = "Uploading ${f.name}"
+            n += io { uploadTree(c, dir, f) }
+        }
+        if (clip.isMove) {
+            // Only reached when every upload worked; a failure above leaves the originals alone.
+            io { clip.paths.forEach { File(it).deleteRecursively() } }
+            SharedClipboard.set(null)
+        }
+        items = io { sorted(c.list(dir)) }
+        message = if (clip.isMove) "Moved $n file(s) here" else "Copied $n file(s) here"
+    }
+
+    private fun uploadTree(c: RemoteClient, dir: String, f: File): Int {
+        if (!f.isDirectory) {
+            f.inputStream().buffered().use { c.upload(dir, f.name, it, f.length()) }
+            return 1
+        }
+        c.mkdir(dir, f.name)
+        val made = c.list(dir).firstOrNull { it.isDirectory && it.name == f.name } ?: error("Couldn't find the new folder ${f.name}")
+        return f.listFiles().orEmpty().sumOf { uploadTree(c, made.path, it) }
+    }
+
     fun mkdir(name: String) = launch("New folder") {
-        val c = client ?: return@launch; c.mkdir(path, name.trim())
-        items = c.list(path).sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+        val c = client ?: return@launch
+        val dir = path
+        items = io { c.mkdir(dir, name.trim()); sorted(c.list(dir)) }
     }
 
     fun rename(item: RemoteItem, name: String) = launch("Rename") {
-        val c = client ?: return@launch; c.rename(item, name.trim())
-        items = c.list(path).sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+        val c = client ?: return@launch
+        val dir = path
+        items = io { c.rename(item, name.trim()); sorted(c.list(dir)) }
     }
 
     fun remove(item: RemoteItem) = launch("Delete") {
-        val c = client ?: return@launch; c.delete(item)
-        items = c.list(path).sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
+        val c = client ?: return@launch
+        val dir = path
+        items = io { c.delete(item); sorted(c.list(dir)) }
     }
 
     fun forgetHostKey(conn: NetworkConnection) { hostKeys.forget("${conn.host}:${conn.port}"); message = "Forgot the saved server identity for ${conn.host}" }
@@ -175,6 +313,8 @@ fun NetworkScreen(onBack: () -> Unit, viewModel: NetworkViewModel = hiltViewMode
     var editing by remember { mutableStateOf<NetworkConnection?>(null) }
     var newFolder by remember { mutableStateOf(false) }
     var renaming by remember { mutableStateOf<RemoteItem?>(null) }
+    var renamingAccount by remember { mutableStateOf<NetworkConnection?>(null) }
+    var showPickHelp by remember { mutableStateOf(false) }
     var deleting by remember { mutableStateOf<RemoteItem?>(null) }
     var menuFor by remember { mutableStateOf<RemoteItem?>(null) }
     LaunchedEffect(viewModel.message) {
@@ -186,14 +326,11 @@ fun NetworkScreen(onBack: () -> Unit, viewModel: NetworkViewModel = hiltViewMode
         }
     }
     val treePicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
-        if (uri != null) {
-            context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            val label = uri.authority?.substringAfterLast('.')?.replaceFirstChar { it.uppercase() } ?: "Provider"
-            viewModel.save(NetworkConnection(java.util.UUID.randomUUID().toString(), "$label (${uri.lastPathSegment?.substringAfterLast(':')?.ifBlank { "root" }})", "saf", uri.toString(), 0), "")
-        }
+        if (uri != null) viewModel.addProvider(uri)
     }
     val uploadPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris -> if (uris.isNotEmpty()) viewModel.upload(uris) }
 
+    val clip by SharedClipboard.state.collectAsStateWithLifecycle()
     val connected = viewModel.active != null
     BackHandler(enabled = connected) { if (!viewModel.up()) viewModel.disconnect() }
 
@@ -213,10 +350,29 @@ fun NetworkScreen(onBack: () -> Unit, viewModel: NetworkViewModel = hiltViewMode
         },
         floatingActionButton = {
             if (!connected) ExtendedFloatingActionButton(onClick = { editing = NetworkConnection(java.util.UUID.randomUUID().toString(), "", "sftp", "", 22) }, icon = { Icon(Icons.Default.Add, null) }, text = { Text("Add server") })
+            else clip?.let { cb ->
+                ExtendedFloatingActionButton(
+                    onClick = { if (!viewModel.busy) viewModel.pasteClipboard() },
+                    icon = { Icon(Icons.Default.ContentPaste, null) },
+                    text = { Text("${if (cb.isMove) "Move" else "Paste"} ${cb.paths.size} item(s) here") }
+                )
+            }
         }
     ) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
             if (viewModel.busy) { LinearProgressIndicator(Modifier.fillMaxWidth()); Text(viewModel.status, Modifier.padding(horizontal = 16.dp, vertical = 4.dp), style = MaterialTheme.typography.bodySmall) }
+            viewModel.error?.let { err ->
+                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(err, Modifier.weight(1f), color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                    TextButton(onClick = {
+                        viewModel.error = null
+                        // Try the same thing again: reload this folder, or reconnect from the account list.
+                        if (viewModel.active != null) viewModel.openCrumb(viewModel.crumbs.lastIndex)
+                        else viewModel.lastAttempt?.let { viewModel.connect(it) }
+                    }) { Text("Retry") }
+                    TextButton(onClick = { viewModel.error = null }) { Text("Dismiss") }
+                }
+            }
             if (!connected) {
                 LazyColumn(Modifier.weight(1f)) {
                     item {
@@ -224,7 +380,7 @@ fun NetworkScreen(onBack: () -> Unit, viewModel: NetworkViewModel = hiltViewMode
                             headlineContent = { Text("Add cloud storage") },
                             supportingContent = { Text("Google Drive, Dropbox, OneDrive and others that appear in the Android file picker") },
                             leadingContent = { Icon(Icons.Default.Cloud, null) },
-                            modifier = Modifier.clickable { treePicker.launch(null) }
+                            modifier = Modifier.clickable { showPickHelp = true }
                         )
                         HorizontalDivider()
                     }
@@ -232,11 +388,12 @@ fun NetworkScreen(onBack: () -> Unit, viewModel: NetworkViewModel = hiltViewMode
                     items(user.connections, key = { it.id }) { c ->
                         ListItem(
                             headlineContent = { Text(c.name.ifBlank { c.host }) },
-                            supportingContent = { Text(if (c.protocol == "saf") "Cloud / document provider" else "${c.protocol.uppercase()} · ${c.user.ifBlank { "anonymous" }}@${c.host}:${c.port}") },
+                            supportingContent = { Text(if (c.protocol == "saf") "Cloud · shows the folder \"${viewModel.shownFolders[c.id] ?: "…"}\"" else "${c.protocol.uppercase()} · ${c.user.ifBlank { "anonymous" }}@${c.host}:${c.port}") },
                             leadingContent = { Icon(if (c.protocol == "saf") Icons.Default.Cloud else Icons.Default.Storage, null) },
                             trailingContent = {
                                 Row {
                                     if (c.protocol != "saf") IconButton(onClick = { editing = c }) { Icon(Icons.Default.Edit, "Edit") }
+                                    else IconButton(onClick = { renamingAccount = c }) { Icon(Icons.Default.Edit, "Rename ${c.name}") }
                                     IconButton(onClick = { viewModel.delete(c) }) { Icon(Icons.Default.Delete, "Remove") }
                                 }
                             },
@@ -245,20 +402,29 @@ fun NetworkScreen(onBack: () -> Unit, viewModel: NetworkViewModel = hiltViewMode
                     }
                 }
             } else {
-                Text(viewModel.path, Modifier.padding(horizontal = 16.dp, vertical = 6.dp), style = MaterialTheme.typography.labelMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                val crumbScroll = rememberScrollState()
+                LaunchedEffect(viewModel.crumbs.size) { crumbScroll.scrollTo(crumbScroll.maxValue) }
+                Row(Modifier.fillMaxWidth().horizontalScroll(crumbScroll).padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    viewModel.crumbs.forEachIndexed { i, crumb ->
+                        if (i > 0) Text("›", style = MaterialTheme.typography.bodyLarge)
+                        TextButton(onClick = { viewModel.openCrumb(i) }, enabled = i < viewModel.crumbs.lastIndex) {
+                            Text(crumb.name, maxLines = 1, style = MaterialTheme.typography.labelLarge)
+                        }
+                    }
+                }
                 LazyColumn(Modifier.weight(1f)) {
                     if (viewModel.items.isEmpty() && !viewModel.busy) item { Text("Empty folder", Modifier.padding(16.dp)) }
                     items(viewModel.items, key = { it.path }) { it ->
                         Box {
                             ListItem(
-                                headlineContent = { Text(it.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                                headlineContent = { Text(it.name, maxLines = 3, overflow = TextOverflow.Ellipsis) },
                                 supportingContent = {
                                     Text(listOfNotNull(if (it.isDirectory) "Folder" else formatSize(it.size),
                                         it.modified.takeIf { m -> m > 0 }?.let { m -> DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(m)) }).joinToString(" · "))
                                 },
-                                leadingContent = { Icon(if (it.isDirectory) Icons.Default.Folder else Icons.Default.InsertDriveFile, null) },
+                                leadingContent = { Icon(remoteIcon(it), null, tint = MaterialTheme.colorScheme.primary) },
                                 trailingContent = { IconButton(onClick = { menuFor = it }) { Icon(Icons.Default.MoreVert, "Actions for ${it.name}") } },
-                                modifier = Modifier.clickable { if (it.isDirectory) viewModel.open(it.path) else viewModel.download(it) }
+                                modifier = Modifier.clickable { if (it.isDirectory) viewModel.openFolder(it) else viewModel.download(it) }
                             )
                             DropdownMenu(menuFor == it, { menuFor = null }) {
                                 if (!it.isDirectory) DropdownMenuItem(text = { Text("Download") }, leadingIcon = { Icon(Icons.Default.Download, null) }, onClick = { menuFor = null; viewModel.download(it) })
@@ -275,12 +441,58 @@ fun NetworkScreen(onBack: () -> Unit, viewModel: NetworkViewModel = hiltViewMode
     editing?.let { c -> ConnectionDialog(c, hasPassword = user.connections.any { it.id == c.id && it.password.isNotEmpty() },
         onDismiss = { editing = null }, onSave = { conn, pw -> viewModel.save(conn, pw); editing = null },
         onForgetKey = { viewModel.forgetHostKey(c) }) }
+    if (showPickHelp) AlertDialog(
+        onDismissRequest = { showPickHelp = false },
+        title = { Text("Choose what to share") },
+        text = {
+            Text(
+                "Android shows its own folder picker next. This app can only see the folder you pick there.\n\n" +
+                    "To see everything in Google Drive, open the \"My Drive\" folder and tap \"Use this folder\". " +
+                    "Picking a smaller folder, such as Classroom, shows only that folder."
+            )
+        },
+        confirmButton = { TextButton(onClick = { showPickHelp = false; treePicker.launch(null) }) { Text("Open the picker") } },
+        dismissButton = { TextButton(onClick = { showPickHelp = false }) { Text("Cancel") } }
+    )
+    renamingAccount?.let { acct ->
+        com.sza.androidfolderexplorer.presentation.browser.PromptDialog(
+            "Rename account", "Name", acct.name, "Rename", { renamingAccount = null },
+            { viewModel.save(acct.copy(name = it.trim()), ""); renamingAccount = null }
+        )
+    }
     if (newFolder) com.sza.androidfolderexplorer.presentation.browser.PromptDialog("New folder", "Name", "", "Create", { newFolder = false }, { viewModel.mkdir(it); newFolder = false })
     renaming?.let { r -> com.sza.androidfolderexplorer.presentation.browser.PromptDialog("Rename", "Name", r.name, "Rename", { renaming = null }, { viewModel.rename(r, it); renaming = null }) }
     deleting?.let { d -> AlertDialog(onDismissRequest = { deleting = null }, title = { Text("Delete ${d.name}?") },
         text = { Text("This deletes it on the server. It cannot be undone.") },
         confirmButton = { TextButton(onClick = { viewModel.remove(d); deleting = null }) { Text("Delete") } },
         dismissButton = { TextButton(onClick = { deleting = null }) { Text("Cancel") } }) }
+}
+
+/** An icon for the kind of file, or for Google's own document types. */
+private fun remoteIcon(item: RemoteItem): androidx.compose.ui.graphics.vector.ImageVector {
+    if (item.isDirectory) return Icons.Default.Folder
+    val mime = item.mime.orEmpty()
+    return when {
+        mime.startsWith("application/vnd.google-apps.spreadsheet") -> Icons.Default.TableChart
+        mime.startsWith("application/vnd.google-apps") -> Icons.Default.Description
+        else -> when (FileTypes.kindOf(item.name)) {
+            FileKind.IMAGE -> Icons.Default.Image
+            FileKind.VIDEO -> Icons.Default.Movie
+            FileKind.AUDIO -> Icons.Default.MusicNote
+            FileKind.PDF -> Icons.Default.PictureAsPdf
+            FileKind.ARCHIVE -> Icons.Default.Archive
+            FileKind.APK -> Icons.Default.Android
+            FileKind.TEXT, FileKind.MARKDOWN, FileKind.LOG -> Icons.Default.Description
+            FileKind.JSON, FileKind.XML -> Icons.Default.Code
+            FileKind.CSV -> Icons.Default.TableChart
+            else -> when {
+                mime.startsWith("image/") -> Icons.Default.Image
+                mime.startsWith("video/") -> Icons.Default.Movie
+                mime.startsWith("audio/") -> Icons.Default.MusicNote
+                else -> Icons.Default.InsertDriveFile
+            }
+        }
+    }
 }
 
 @Composable

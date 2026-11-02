@@ -8,6 +8,7 @@ import androidx.core.content.FileProvider
 import com.sza.androidfolderexplorer.data.FileKind
 import com.sza.androidfolderexplorer.data.FileTypes
 import com.sza.androidfolderexplorer.data.diag.Diagnostics
+import com.sza.androidfolderexplorer.data.network.CloudNames
 import com.sza.androidfolderexplorer.data.ops.OpenRequests
 import com.sza.androidfolderexplorer.data.settings.FolderView
 import com.sza.androidfolderexplorer.data.settings.UserData
@@ -102,6 +103,14 @@ class FileBrowserViewModel @Inject constructor(
             dualPane = appSettings.state.value.dualPane,
             showOnboarding = !appSettings.state.value.onboardingDone
         )
+        // Cloud accounts saved by older versions carry the provider's raw id as their name; fix that now
+        // so the hamburger menu shows "Google Drive · you@gmail.com".
+        viewModelScope.launch(Dispatchers.IO) {
+            userData.state.value.connections.filter { it.protocol == "saf" && CloudNames.looksRaw(it.name) }.forEach { c ->
+                val fixed = runCatching { CloudNames.describe(context, Uri.parse(c.host)) }.getOrNull() ?: return@forEach
+                userData.update { st -> st.copy(connections = st.connections.map { if (it.id == c.id) it.copy(name = fixed) else it }) }
+            }
+        }
         navigateTo(OpenRequests.path.value ?: lastPath)
         OpenRequests.consume()
         // Open folders requested from a widget, the share receiver or a shortcut.
@@ -137,6 +146,15 @@ class FileBrowserViewModel @Inject constructor(
                     _uiState.value = _uiState.value.copy(showHidden = show)
                     navigateTo(_uiState.value.currentPath)
                 }
+        }
+    }
+
+    init {
+        // A move pasted into a cloud folder clears the shared clipboard; drop the "Paste here" bar to match.
+        viewModelScope.launch {
+            SharedClipboard.state.collect { c ->
+                if (c == null && _uiState.value.clipboard != null) _uiState.value = _uiState.value.copy(clipboard = null)
+            }
         }
     }
 
@@ -233,16 +251,49 @@ class FileBrowserViewModel @Inject constructor(
         _uiState.value = _uiState.value.copy(viewerPaths = null, selectedPaths = emptySet())
     }
 
-    /** Adds a custom quick-access folder. Returns an error message, or null on success. */
-    fun addQuickFolder(rawPath: String): String? {
-        val path = rawPath.trim().trimEnd('/')
+    /** Checks a quick-access path. Returns an error message, or null when it is fine. [ignore] is the entry being edited. */
+    private fun quickPathError(path: String, ignore: String? = null): String? {
+        if (!path.startsWith("/")) return "Path must start with /"
+        if (_uiState.value.quickFolders.any { it.path == path && it.path != ignore }) return "Already in quick access"
         val root = FileBrowserUiState.STORAGE_ROOT
-        if (path != root && !path.startsWith("$root/")) return "Folder must be inside $root"
-        if (_uiState.value.quickFolders.any { it.path == path }) return "Already in quick access"
-        if (!File(path).isDirectory) return "Folder not found or not accessible"
-        saveCustomQuickFolders(customQuickFolderPaths() + path)
-        _uiState.value = _uiState.value.copy(quickFolders = loadQuickFolders())
+        if ((path == root || path.startsWith("$root/")) && !File(path).isDirectory) return "Folder not found or not accessible"
         return null
+    }
+
+    private fun normaliseQuickPath(raw: String): String = raw.trim().trimEnd('/').ifEmpty { "/" }
+
+    /** Adds a quick-access folder. Returns an error message, or null on success. */
+    fun addQuickFolder(rawPath: String): String? {
+        val path = normaliseQuickPath(rawPath)
+        quickPathError(path)?.let { return it }
+        saveQuickFolders(_uiState.value.quickFolders + QuickFolder(File(path).name.ifEmpty { "Device root" }, path, isCustom = true))
+        return null
+    }
+
+    /** Renames and/or re-points one entry. Returns an error message, or null on success. */
+    fun updateQuickFolder(oldPath: String, newName: String, rawPath: String): String? {
+        val path = normaliseQuickPath(rawPath)
+        val name = newName.trim().replace(Regex("[\\t\\r\\n]"), " ")
+        if (name.isEmpty()) return "Name can't be empty"
+        quickPathError(path, ignore = oldPath)?.let { return it }
+        saveQuickFolders(_uiState.value.quickFolders.map { if (it.path == oldPath) it.copy(name = name, path = path) else it })
+        return null
+    }
+
+    /** Moves an entry up (-1) or down (+1) in the list. */
+    fun moveQuickFolder(path: String, delta: Int) {
+        val list = _uiState.value.quickFolders.toMutableList()
+        val i = list.indexOfFirst { it.path == path }
+        val j = i + delta
+        if (i < 0 || j !in list.indices) return
+        list.add(j, list.removeAt(i))
+        saveQuickFolders(list)
+    }
+
+    /** Puts back the built-in list and drops every change. */
+    fun resetQuickFolders() {
+        prefs.edit().remove(PREF_QUICK_V2).remove(PREF_QUICK_CUSTOM).apply()
+        _uiState.value = _uiState.value.copy(quickFolders = loadQuickFolders())
     }
 
     /** Lists the subfolders of [path] for the in-app folder chooser. Files are left out. */
@@ -250,18 +301,23 @@ class FileBrowserViewModel @Inject constructor(
         browseDirectory(path, countChildren = false).map { items -> items.filter { it.isDirectory } }
 
     fun removeQuickFolder(path: String) {
-        saveCustomQuickFolders(customQuickFolderPaths() - path)
-        _uiState.value = _uiState.value.copy(quickFolders = loadQuickFolders())
+        saveQuickFolders(_uiState.value.quickFolders.filter { it.path != path })
     }
 
-    private fun customQuickFolderPaths(): List<String> =
-        prefs.getString(PREF_QUICK_CUSTOM, "").orEmpty().split('\n').filter { it.isNotBlank() }
-
-    private fun saveCustomQuickFolders(paths: List<String>) {
-        prefs.edit().putString(PREF_QUICK_CUSTOM, paths.distinct().joinToString("\n")).apply()
+    /** One line per entry, "name<TAB>path", in display order. */
+    private fun saveQuickFolders(list: List<QuickFolder>) {
+        prefs.edit().putString(PREF_QUICK_V2, list.joinToString("\n") { "${it.name}\t${it.path}" }).apply()
+        _uiState.value = _uiState.value.copy(quickFolders = list)
     }
 
     private fun loadQuickFolders(): List<QuickFolder> {
+        prefs.getString(PREF_QUICK_V2, null)?.let { raw ->
+            return raw.split('\n').mapNotNull { line ->
+                val tab = line.indexOf('\t')
+                if (tab <= 0) null else QuickFolder(line.substring(0, tab), line.substring(tab + 1), isCustom = true)
+            }
+        }
+        // Nothing saved yet: the built-in list, then any folders pinned with the older version of this feature.
         val root = FileBrowserUiState.STORAGE_ROOT
         val defaults = listOf(
             QuickFolder("Internal storage", root, isCustom = false),
@@ -269,8 +325,9 @@ class FileBrowserViewModel @Inject constructor(
         ) + DEFAULT_QUICK_FOLDERS.map { name ->
             QuickFolder(name, "$root/$name", isCustom = false)
         }
-        val custom = customQuickFolderPaths().map { QuickFolder(File(it).name, it, isCustom = true) }
-        return defaults + custom
+        val legacy = prefs.getString(PREF_QUICK_CUSTOM, "").orEmpty().split('\n').filter { it.isNotBlank() }
+            .map { QuickFolder(File(it).name, it, isCustom = true) }
+        return (defaults + legacy).distinctBy { it.path }
     }
 
     // ---- Text editor ----
@@ -465,14 +522,30 @@ class FileBrowserViewModel @Inject constructor(
 
     private fun uriFor(path: String) = FileProvider.getUriForFile(context, "${context.packageName}.files", File(path))
 
-    fun openExternally(path: String, mime: String? = null) {
+    /**
+     * Opens [path] in another app. APKs go straight to the system installer and other files to the
+     * default app for their type, with no "Open with" picker. Pass [chooser] = true to always pick.
+     */
+    fun openExternally(path: String, mime: String? = null, chooser: Boolean = false) {
+        val type = mime ?: FileTypes.mimeOf(File(path).name)
+        val isApk = type == "application/vnd.android.package-archive" || path.endsWith(".apk", ignoreCase = true)
         try {
-            val intent = Intent(Intent.ACTION_VIEW)
-                .setDataAndType(uriFor(path), mime ?: FileTypes.mimeOf(File(path).name))
-                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            context.startActivity(Intent.createChooser(intent, "Open with").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            val uri = uriFor(path)
+            val view = Intent(Intent.ACTION_VIEW).setDataAndType(uri, type)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            when {
+                chooser -> context.startActivity(Intent.createChooser(view, "Open with").addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+                isApk -> {
+                    // Hands the file to the system package installer directly; it shows Android's own install prompt.
+                    @Suppress("DEPRECATION")
+                    val install = Intent(Intent.ACTION_INSTALL_PACKAGE).setData(uri)
+                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+                    try { context.startActivity(install) } catch (_: ActivityNotFoundException) { context.startActivity(view) }
+                }
+                else -> context.startActivity(view)
+            }
         } catch (e: ActivityNotFoundException) {
-            showSnackbar("No app can open this file")
+            showSnackbar("No app can open this file. Try Open as\u2026 > Another app.")
         } catch (e: Exception) {
             showSnackbar("Can't open: ${e.message}")
         }
@@ -641,6 +714,7 @@ class FileBrowserViewModel @Inject constructor(
     fun stageSelection(isMove: Boolean) {
         val selected = _uiState.value.selectedPaths.toList()
         if (selected.isEmpty()) return
+        SharedClipboard.set(ClipboardState(selected, isMove))
         _uiState.value = _uiState.value.copy(
             clipboard = ClipboardState(selected, isMove),
             selectedPaths = emptySet()
@@ -670,6 +744,7 @@ class FileBrowserViewModel @Inject constructor(
     }
 
     fun cancelClipboard() {
+        SharedClipboard.set(null)
         _uiState.value = _uiState.value.copy(clipboard = null)
     }
 
@@ -689,6 +764,7 @@ class FileBrowserViewModel @Inject constructor(
         }
         executeOperation(clip.isMove, sources, dest) {
             if (clip.isMove) {
+                SharedClipboard.set(null)
                 _uiState.value = _uiState.value.copy(clipboard = null)
                 offerMoveUndo(sources, dest)
             }
@@ -884,6 +960,7 @@ class FileBrowserViewModel @Inject constructor(
     private companion object {
         const val ROOT_LABEL = "Internal storage"
         const val PREF_QUICK_CUSTOM = "quick_access_custom"
+        const val PREF_QUICK_V2 = "quick_access_v2"
         const val MAX_SEARCH_RESULTS = 2000
         val TEXT_KINDS = setOf(FileKind.TEXT, FileKind.MARKDOWN, FileKind.JSON, FileKind.XML, FileKind.CSV, FileKind.LOG)
         val DEFAULT_QUICK_FOLDERS = listOf(

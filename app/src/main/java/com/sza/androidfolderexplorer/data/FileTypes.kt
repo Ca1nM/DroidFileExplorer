@@ -33,7 +33,7 @@ object FileTypes {
             e == "log" -> FileKind.LOG
             e in TEXT -> FileKind.TEXT
             e in ARCHIVE -> FileKind.ARCHIVE
-            e == "apk" -> FileKind.APK
+            e == "apk" || e in setOf("apks", "xapk", "apkm") -> FileKind.APK
             e.matches(Regex("\\d{3}")) -> FileKind.SPLIT_PART
             else -> FileKind.OTHER
         }
