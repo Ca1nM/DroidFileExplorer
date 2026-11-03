@@ -28,5 +28,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "AndroidFolderExplorer"
+rootProject.name = "DroidFileExplorer"
 include(":app")

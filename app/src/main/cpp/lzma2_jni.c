@@ -22,7 +22,7 @@ static void free_fn(ISzAllocPtr p, void *address) {
 static const ISzAlloc g_alloc = { alloc_fn, free_fn };
 
 JNIEXPORT jlong JNICALL
-Java_com_sza_androidfolderexplorer_data_source_Lzma2Native_create(JNIEnv *env, jclass cls, jint prop) {
+Java_com_ca1nm_droidfileexplorer_data_source_Lzma2Native_create(JNIEnv *env, jclass cls, jint prop) {
     (void)env; (void)cls;
     CLzma2Dec *dec = (CLzma2Dec *)malloc(sizeof(CLzma2Dec));
     if (dec == NULL) return 0;
@@ -36,7 +36,7 @@ Java_com_sza_androidfolderexplorer_data_source_Lzma2Native_create(JNIEnv *env, j
 }
 
 JNIEXPORT jint JNICALL
-Java_com_sza_androidfolderexplorer_data_source_Lzma2Native_decode(
+Java_com_ca1nm_droidfileexplorer_data_source_Lzma2Native_decode(
         JNIEnv *env, jclass cls, jlong handle,
         jbyteArray in, jint inOff, jint inLen,
         jbyteArray out, jint outOff, jint outLen, jintArray res) {
@@ -67,7 +67,7 @@ Java_com_sza_androidfolderexplorer_data_source_Lzma2Native_decode(
 }
 
 JNIEXPORT void JNICALL
-Java_com_sza_androidfolderexplorer_data_source_Lzma2Native_destroy(JNIEnv *env, jclass cls, jlong handle) {
+Java_com_ca1nm_droidfileexplorer_data_source_Lzma2Native_destroy(JNIEnv *env, jclass cls, jlong handle) {
     (void)env; (void)cls;
     CLzma2Dec *dec = (CLzma2Dec *)(intptr_t)handle;
     if (dec == NULL) return;

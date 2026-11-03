@@ -1,6 +1,6 @@
 <component name="ProjectRunConfigurationManager">
   <configuration default="false" name="app" type="AndroidRunConfigurationType" factoryName="Android App">
-    <module name="AndroidFolderExplorer.app" />
+    <module name="DroidFileExplorer.app" />
     <option name="DEPLOY" value="DEFAULT_APK" />
     <option name="DEPLOY_AS_INSTANT" value="false" />
     <option name="ARTIFACT_NAME" value="" />

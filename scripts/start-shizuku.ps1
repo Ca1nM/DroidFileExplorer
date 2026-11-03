@@ -134,7 +134,7 @@ Write-Host "`n[6] Checking Shizuku service status..." -ForegroundColor Cyan
 $running = Invoke-Adb "shell","ps -A 2>/dev/null | grep shizuku_server || echo ''" 2>&1
 if ($running -match "shizuku_server") {
     Write-Host "    Shizuku is already running!" -ForegroundColor Green
-    Write-Host "    -> Open AndroidFolderExplorer and tap Retry to grant permission." -ForegroundColor Yellow
+    Write-Host "    -> Open Files and tap Retry to grant permission." -ForegroundColor Yellow
     exit 0
 }
 
@@ -151,7 +151,7 @@ Write-Host "`n[8] Verifying..." -ForegroundColor Cyan
 $verify = Invoke-Adb "shell","ps -A 2>/dev/null | grep shizuku_server || echo ''" 2>&1
 if ($verify -match "shizuku_server") {
     Write-Host "    Shizuku started successfully!" -ForegroundColor Green
-    Write-Host "    -> Open AndroidFolderExplorer and tap Retry." -ForegroundColor Yellow
+    Write-Host "    -> Open Files and tap Retry." -ForegroundColor Yellow
 } else {
     Write-Host "    Service did not start. Check logcat for details:" -ForegroundColor Red
     Write-Host "      adb -s $($target.Serial) shell logcat -d -s Shizuku:* | tail -30" -ForegroundColor White

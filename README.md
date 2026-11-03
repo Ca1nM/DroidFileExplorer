@@ -1,8 +1,13 @@
-# AndroidFolderExplorer
+# DroidFileExplorer
 
 A file manager for Android that exposes `Android/data/`, `Android/obb/`, and other restricted directories hidden since Android 11.
 
 > **Not available on Google Play.** Distributed as a sideloaded APK only.
+>
+> Once installed, the app is simply called **Files** on your phone.
+
+> **Based on [AndroidFolderExplorer](https://github.com/SerZhyAle/AndroidFolderExplorer) by Serhii Zhyhunenko (SerZhyAle),**
+> used and modified under the Apache License 2.0. See [Credits and changes](#credits-and-changes).
 
 ---
 
@@ -51,7 +56,7 @@ Android 11+ blocks direct `File` API access to `Android/data`. This app uses a t
 1. **Install the APK** — download from [Releases](../../releases).
 2. **Launch the app.**
 3. The app will show a dialog explaining why the permission is needed. Tap **Open Settings**.
-4. Android opens **Settings → Special app access → All files access**. Find **AndroidFolderExplorer** and toggle it **ON**.
+4. Android opens **Settings → Special app access → All files access**. Find **Files** and toggle it **ON**.
 5. Return to the app (press Back or use the Recent Apps button).
 6. The app reloads the current directory automatically.
 
@@ -114,9 +119,9 @@ Choose **one** of the methods below. You only need to do this once per boot (or 
 5. Follow the on-screen prompts — Shizuku pairs itself automatically.
 6. Enable **"Start on Launch"** in Shizuku settings so it restarts after every reboot.
 
-#### Step 3 — Grant permission to AndroidFolderExplorer
+#### Step 3 — Grant permission to Files
 
-1. Launch **AndroidFolderExplorer**.
+1. Launch **Files**.
 2. Navigate to `Android/data/` — a dialog appears.
 3. Tap **Allow** on the Shizuku permission prompt.
 4. Done — full directory access is now active.
@@ -129,7 +134,7 @@ Choose **one** of the methods below. You only need to do this once per boot (or 
 
 Pre-built APKs are available on the [Releases](../../releases) page.
 
-Latest: **AndroidFolderExplorer_v2-release.apk**
+Latest: **DroidFileExplorer_<version>-release.apk**
 
 ---
 
@@ -144,7 +149,9 @@ Requirements:
 # Debug APK
 ./gradlew assembleDebug
 
-# Release APK (signed with debug keystore)
+# Release APK. Signed only if you provide your own keystore: put it at keys/release.keystore and the passwords in
+# keys/signing.properties (storePassword=..., keyPassword=..., keyAlias=...; git-ignored), or set the
+# DFE_STORE_PASSWORD / DFE_KEY_PASSWORD / DFE_KEY_ALIAS environment variables. Otherwise the APK is left unsigned.
 ./gradlew assembleRelease
 
 # Run unit tests
@@ -154,7 +161,7 @@ Requirements:
 ./gradlew lint
 ```
 
-Output: `app/build/outputs/apk/release/AndroidFolderExplorer_v2-release.apk`
+Output: `app/build/outputs/apk/release/DroidFileExplorer_<version>-release.apk`
 
 > The release build uses the Android debug keystore (`~/.android/debug.keystore`) for signing. To use a production keystore, update `signingConfigs` in `app/build.gradle.kts`.
 
@@ -179,7 +186,7 @@ Output: `app/build/outputs/apk/release/AndroidFolderExplorer_v2-release.apk`
 ## Architecture
 
 ```
-app/src/main/java/com/afex/explorer/
+app/src/main/java/com/ca1nm/droidfileexplorer/
 ├── presentation/
 │   ├── browser/          # FileBrowserScreen, FileBrowserViewModel
 │   └── permissions/      # Permission rationale UI
@@ -234,7 +241,7 @@ Data flow: `Screen → ViewModel → UseCase → Repository → DataSource`
 1. **Установите APK** — скачайте из раздела [Releases](../../releases).
 2. **Запустите приложение.**
 3. Приложение покажет диалог с объяснением, зачем нужно разрешение. Нажмите **Открыть настройки**.
-4. Android откроет **Настройки → Приложения → Специальный доступ → Доступ ко всем файлам**. Найдите **AndroidFolderExplorer** и переключите в положение **ВКЛ**.
+4. Android откроет **Настройки → Приложения → Специальный доступ → Доступ ко всем файлам**. Найдите **Files** и переключите в положение **ВКЛ**.
 5. Вернитесь в приложение (кнопка Назад или Последние приложения).
 6. Приложение автоматически перезагрузит текущую директорию.
 
@@ -297,9 +304,9 @@ Data flow: `Screen → ViewModel → UseCase → Repository → DataSource`
 5. Следуйте инструкциям на экране — Shizuku выполняет сопряжение автоматически.
 6. Включите **«Запускать при старте»** в настройках Shizuku, чтобы служба запускалась после каждой перезагрузки.
 
-#### Шаг 3 — Выдача разрешения приложению AndroidFolderExplorer
+#### Шаг 3 — Выдача разрешения приложению Files
 
-1. Запустите **AndroidFolderExplorer**.
+1. Запустите **Files**.
 2. Перейдите в `Android/data/` — появится диалог.
 3. Нажмите **Разрешить** на запросе разрешения Shizuku.
 4. Готово — полный доступ к директориям активирован.
@@ -311,6 +318,22 @@ Data flow: `Screen → ViewModel → UseCase → Repository → DataSource`
 ## Disclaimer
 
 This app is intended for **personal use and advanced users** who want to manage their own device storage. It relies on privileged APIs and cannot be distributed through the Google Play Store.
+
+---
+
+## Credits and changes
+
+This project started from [AndroidFolderExplorer](https://github.com/SerZhyAle/AndroidFolderExplorer) by
+Serhii Zhyhunenko (SerZhyAle), whose commits are kept in this repository's history. It has since been modified by
+Ca1nM, including:
+
+- a built-in reader for Word, PowerPoint, Excel, OpenDocument, RTF and EPUB files, SQLite databases and fonts
+- syntax colouring in the text editor
+- a Material icon for each file type, and animated GIF/WebP thumbnails
+- opening a file from another app (for example a browser download) now shows it in its folder, highlighted
+- archive browsing as folders, password handling, faster extraction, and many smaller fixes
+
+Bundled fonts: Carlito and Caladea, under the SIL Open Font License 1.1 (see `app/src/main/assets/docfonts/`).
 
 ---
 

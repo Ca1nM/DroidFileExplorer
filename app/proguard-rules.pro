@@ -9,11 +9,11 @@
     kotlinx.serialization.KSerializer serializer(...);
 }
 
--keep,includedescriptorclasses class com.sza.androidfolderexplorer.**$$serializer { *; }
--keepclassmembers class com.sza.androidfolderexplorer.** {
+-keep,includedescriptorclasses class com.ca1nm.droidfileexplorer.**$$serializer { *; }
+-keepclassmembers class com.ca1nm.droidfileexplorer.** {
     *** Companion;
 }
--keepclasseswithmembers class com.sza.androidfolderexplorer.** {
+-keepclasseswithmembers class com.ca1nm.droidfileexplorer.** {
     kotlinx.serialization.KSerializer serializer(...);
 }
 

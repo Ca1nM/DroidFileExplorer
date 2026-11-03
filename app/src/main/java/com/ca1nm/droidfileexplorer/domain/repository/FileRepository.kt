@@ -1,0 +1,12 @@
+package com.ca1nm.droidfileexplorer.domain.repository
+
+import com.ca1nm.droidfileexplorer.domain.model.FileItem
+import com.ca1nm.droidfileexplorer.domain.model.OperationProgress
+import kotlinx.coroutines.flow.Flow
+
+interface FileRepository {
+    suspend fun listDirectory(path: String, countChildren: Boolean = true): Result<List<FileItem>>
+    fun copyFiles(sources: List<String>, destination: String): Flow<OperationProgress>
+    fun moveFiles(sources: List<String>, destination: String): Flow<OperationProgress>
+    suspend fun deleteFiles(paths: List<String>): Result<Int>
+}

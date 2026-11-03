@@ -1,5 +1,6 @@
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import java.util.Properties
 
 plugins {
     alias(libs.plugins.android.application)
@@ -11,7 +12,7 @@ plugins {
 }
 
 android {
-    namespace = "com.sza.androidfolderexplorer"
+    namespace = "com.ca1nm.droidfileexplorer"
     compileSdk = 35
 
     // Version auto-generated from build timestamp: Y.YMMD.Dhhm
@@ -33,7 +34,7 @@ android {
                            min.toLong() / 6L).toInt()
 
     defaultConfig {
-        applicationId = "com.sza.androidfolderexplorer"
+        applicationId = "com.ca1nm.droidfileexplorer"
         minSdk = 28
         targetSdk = 35
         versionCode = autoVersionCode
@@ -50,12 +51,26 @@ android {
         }
     }
 
+    // Release signing. The keystore and its passwords are not stored in the repository: put them in
+    // keys/signing.properties (git-ignored) as storePassword=..., keyPassword=... and optionally keyAlias=..., or set
+    // the DFE_STORE_PASSWORD, DFE_KEY_PASSWORD and DFE_KEY_ALIAS environment variables. The keystore itself goes in
+    // keys/release.keystore. Without them the release build is simply left unsigned.
+    val signingProps = Properties()
+    rootProject.file("keys/signing.properties").let { propsFile ->
+        if (propsFile.exists()) propsFile.inputStream().use { stream -> signingProps.load(stream) }
+    }
+    fun signingValue(key: String, env: String): String? = signingProps.getProperty(key) ?: System.getenv(env)
+    val releaseKeystore = rootProject.file("keys/release.keystore")
+    val canSignRelease = releaseKeystore.exists() && signingValue("storePassword", "DFE_STORE_PASSWORD") != null
+
     signingConfigs {
-        create("release") {
-            storeFile = file("${rootProject.rootDir}/keys/release.keystore")
-            storePassword = "REMOVED-PASSWORD"
-            keyAlias = "AndroidFolderExplorer"
-            keyPassword = "REMOVED-PASSWORD"
+        if (canSignRelease) {
+            create("release") {
+                storeFile = releaseKeystore
+                storePassword = signingValue("storePassword", "DFE_STORE_PASSWORD")
+                keyAlias = signingValue("keyAlias", "DFE_KEY_ALIAS") ?: "DroidFileExplorer"
+                keyPassword = signingValue("keyPassword", "DFE_KEY_PASSWORD") ?: signingValue("storePassword", "DFE_STORE_PASSWORD")
+            }
         }
     }
 
@@ -67,7 +82,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            signingConfig = signingConfigs.getByName("release")
+            signingConfig = if (canSignRelease) signingConfigs.getByName("release") else null
         }
     }
 
@@ -75,7 +90,7 @@ android {
         val variant = this
         outputs.all {
             val output = this as com.android.build.gradle.internal.api.BaseVariantOutputImpl
-            output.outputFileName = "AndroidFolderExplorer_${variant.versionName}-${variant.name}.apk"
+            output.outputFileName = "DroidFileExplorer_${variant.versionName}-${variant.name}.apk"
         }
     }
 

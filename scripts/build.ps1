@@ -1,5 +1,5 @@
 #!/usr/bin/env pwsh
-# build.ps1 — Build debug and/or release APKs for AndroidFolderExplorer
+# build.ps1 — Build debug and/or release APKs for DroidFileExplorer
 # Usage:
 #   .\scripts\build.ps1             # both debug + release
 #   .\scripts\build.ps1 -Debug      # debug only

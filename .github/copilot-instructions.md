@@ -1,4 +1,4 @@
-# AndroidFolderExplorer — Copilot Instructions
+# DroidFileExplorer — Copilot Instructions
 
 ## Project Purpose
 
