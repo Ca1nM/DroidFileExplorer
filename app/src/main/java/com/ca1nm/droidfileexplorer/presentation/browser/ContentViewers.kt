@@ -15,7 +15,20 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.calculateCentroid
+import androidx.compose.foundation.gestures.calculatePan
+import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -438,14 +451,48 @@ private fun PdfView(path: String) {
     when {
         error != null -> Text(error!!, Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error)
         r == null -> CircularProgressIndicator(Modifier.padding(24.dp))
-        else -> LazyColumn(Modifier.fillMaxSize().background(Color(0xFF444444)), verticalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(8.dp)) {
+        else -> {
+        var scale by remember(path) { mutableFloatStateOf(1f) }
+        var offset by remember(path) { mutableStateOf(Offset.Zero) }
+        var box by remember { mutableStateOf(IntSize.Zero) }
+        val listState = rememberLazyListState()
+        Box(
+            Modifier.fillMaxSize().clipToBounds().onSizeChanged { box = it }
+                .pointerInput(path) {
+                    awaitEachGesture {
+                        awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+                        do {
+                            val event = awaitPointerEvent(PointerEventPass.Initial)
+                            val fingers = event.changes.count { it.pressed }
+                            if (fingers >= 2 || scale > 1f) {
+                                val zoom = if (fingers >= 2) event.calculateZoom() else 1f
+                                val pan = event.calculatePan()
+                                val c = event.calculateCentroid(useCurrent = false) - Offset(box.width / 2f, box.height / 2f)
+                                val newScale = (scale * zoom).coerceIn(1f, 5f)
+                                val z = newScale / scale
+                                var o = (offset - c) * z + c + pan
+                                val maxX = (newScale - 1f) * box.width / 2f
+                                val maxY = (newScale - 1f) * box.height / 2f
+                                val clampedY = o.y.coerceIn(-maxY, maxY)
+                                val leftoverY = o.y - clampedY
+                                o = Offset(o.x.coerceIn(-maxX, maxX), clampedY)
+                                scale = newScale
+                                offset = if (newScale <= 1f) Offset.Zero else o
+                                if (leftoverY != 0f) listState.dispatchRawDelta(-leftoverY / newScale)
+                                event.changes.forEach { if (it.positionChanged()) it.consume() }
+                            }
+                        } while (event.changes.any { it.pressed })
+                    }
+                }
+        ) {
+        LazyColumn(state = listState, modifier = Modifier.fillMaxSize().graphicsLayer { scaleX = scale; scaleY = scale; translationX = offset.x; translationY = offset.y }.background(Color(0xFF444444)), verticalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(8.dp)) {
             items(r.pageCount) { index ->
                 val bmp by produceState<Bitmap?>(null, index) {
                     value = PdfLock.withLock {
                         withContext(Dispatchers.IO) {
                             runCatching {
                                 r.openPage(index).use { page ->
-                                    val w = 1400; val h = (w.toFloat() * page.height / page.width).toInt()
+                                    val w = 2000; val h = (w.toFloat() * page.height / page.width).toInt()
                                     Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also {
                                         it.eraseColor(AColor.WHITE)
                                         page.render(it, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
@@ -459,6 +506,8 @@ private fun PdfView(path: String) {
                 if (shown != null) Image(shown.asImageBitmap(), "Page ${index + 1}", Modifier.fillMaxWidth(), contentScale = ContentScale.FillWidth)
                 else Box(Modifier.fillMaxWidth().aspectRatio(0.7f).background(Color.White), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
             }
+        }
+        }
         }
     }
 }
