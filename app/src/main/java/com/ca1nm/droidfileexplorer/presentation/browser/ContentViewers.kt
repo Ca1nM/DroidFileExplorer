@@ -29,6 +29,11 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.geometry.isSpecified
+import androidx.compose.animation.core.VectorConverter
+import kotlin.math.roundToInt
+import kotlinx.coroutines.flow.collectLatest
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -452,62 +457,150 @@ private fun PdfView(path: String) {
         error != null -> Text(error!!, Modifier.padding(16.dp), color = MaterialTheme.colorScheme.error)
         r == null -> CircularProgressIndicator(Modifier.padding(24.dp))
         else -> {
-        var scale by remember(path) { mutableFloatStateOf(1f) }
-        var offset by remember(path) { mutableStateOf(Offset.Zero) }
-        var box by remember { mutableStateOf(IntSize.Zero) }
-        val listState = rememberLazyListState()
-        Box(
-            Modifier.fillMaxSize().clipToBounds().onSizeChanged { box = it }
-                .pointerInput(path) {
-                    awaitEachGesture {
-                        awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
-                        do {
-                            val event = awaitPointerEvent(PointerEventPass.Initial)
-                            val fingers = event.changes.count { it.pressed }
-                            if (fingers >= 2 || scale > 1f) {
-                                val zoom = if (fingers >= 2) event.calculateZoom() else 1f
-                                val pan = event.calculatePan()
-                                val c = event.calculateCentroid(useCurrent = false) - Offset(box.width / 2f, box.height / 2f)
-                                val newScale = (scale * zoom).coerceIn(1f, 5f)
-                                val z = newScale / scale
-                                var o = (offset - c) * z + c + pan
-                                val maxX = (newScale - 1f) * box.width / 2f
-                                val maxY = (newScale - 1f) * box.height / 2f
-                                val clampedY = o.y.coerceIn(-maxY, maxY)
-                                val leftoverY = o.y - clampedY
-                                o = Offset(o.x.coerceIn(-maxX, maxX), clampedY)
-                                scale = newScale
-                                offset = if (newScale <= 1f) Offset.Zero else o
-                                if (leftoverY != 0f) listState.dispatchRawDelta(-leftoverY / newScale)
-                                event.changes.forEach { if (it.positionChanged()) it.consume() }
-                            }
-                        } while (event.changes.any { it.pressed })
+            val uiScope = rememberCoroutineScope()
+            var box by remember { mutableStateOf(IntSize.Zero) }
+            var sizes by remember(path) { mutableStateOf<List<Pair<Int, Int>>>(emptyList()) }
+            LaunchedEffect(r) {
+                sizes = PdfLock.withLock {
+                    withContext(Dispatchers.IO) {
+                        (0 until r.pageCount).map { i -> runCatching { r.openPage(i).use { it.width to it.height } }.getOrDefault(612 to 792) }
                     }
                 }
-        ) {
-        LazyColumn(state = listState, modifier = Modifier.fillMaxSize().graphicsLayer { scaleX = scale; scaleY = scale; translationX = offset.x; translationY = offset.y }.background(Color(0xFF444444)), verticalArrangement = Arrangement.spacedBy(8.dp), contentPadding = PaddingValues(8.dp)) {
-            items(r.pageCount) { index ->
-                val bmp by produceState<Bitmap?>(null, index) {
-                    value = PdfLock.withLock {
-                        withContext(Dispatchers.IO) {
-                            runCatching {
-                                r.openPage(index).use { page ->
-                                    val w = 2000; val h = (w.toFloat() * page.height / page.width).toInt()
-                                    Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also {
-                                        it.eraseColor(AColor.WHITE)
-                                        page.render(it, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+            }
+            val density = androidx.compose.ui.platform.LocalDensity.current
+            val gap = with(density) { 8.dp.toPx() }
+            val docW = box.width.toFloat()
+            val tops = remember(sizes, box.width) { FloatArray(sizes.size) }
+            val heights = remember(sizes, box.width) { FloatArray(sizes.size) }
+            val docH = remember(sizes, box.width) {
+                var y = gap
+                sizes.forEachIndexed { i, (pw, ph) -> tops[i] = y; heights[i] = docW * ph / pw; y += heights[i] + gap }
+                y
+            }
+            val dH by rememberUpdatedState(docH)
+            val dW by rememberUpdatedState(docW)
+            var scale by remember(path) { mutableFloatStateOf(1f) }
+            var offX by remember(path) { mutableFloatStateOf(0f) }
+            var offY by remember(path) { mutableFloatStateOf(0f) }
+            val cache = remember(path) { mutableStateMapOf<Int, Pair<ImageBitmap, Int>>() }
+
+            fun clampX(x: Float, s: Float): Float = if (dW * s <= box.width) (box.width - dW * s) / 2f else x.coerceIn(box.width - dW * s, 0f)
+            fun clampY(y: Float, s: Float): Float = if (dH * s <= box.height) 0f else y.coerceIn(box.height - dH * s, 0f)
+
+            LaunchedEffect(sizes, box.width) {
+                if (sizes.isEmpty() || box.width == 0) return@LaunchedEffect
+                snapshotFlow {
+                    val s = scale
+                    var first = -1; var last = -1
+                    for (i in sizes.indices) {
+                        val top = offY + tops[i] * s
+                        if (top + heights[i] * s > 0f && top < box.height) { if (first < 0) first = i; last = i }
+                    }
+                    Triple(first, last, ((box.width * s).coerceIn(1200f, 2800f) / 200f).roundToInt() * 200)
+                }.collectLatest { (first, last, wt) ->
+                    if (first < 0) return@collectLatest
+                    delay(120)
+                    for (i in (first - 1).coerceAtLeast(0)..(last + 1).coerceAtMost(sizes.lastIndex)) {
+                        val have = cache[i]
+                        if (have != null && have.second >= wt * 0.85) continue
+                        val (pw, ph) = sizes[i]
+                        val w = minOf(wt, kotlin.math.sqrt(48_000_000.0 / 4.0 * pw / ph).toInt())
+                        val h = (w.toFloat() * ph / pw).toInt()
+                        val bmp = PdfLock.withLock {
+                            withContext(Dispatchers.IO) {
+                                runCatching {
+                                    r.openPage(i).use { page ->
+                                        Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also {
+                                            it.eraseColor(AColor.WHITE)
+                                            page.render(it, null, null, PdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
+                                        }
                                     }
+                                }.getOrNull()
+                            }
+                        }
+                        if (bmp != null) cache[i] = bmp.asImageBitmap() to wt
+                    }
+                    val keep = (first - 2)..(last + 2)
+                    cache.keys.filter { it !in keep }.forEach { cache.remove(it) }
+                }
+            }
+
+            androidx.compose.foundation.Canvas(
+                Modifier.fillMaxSize().clipToBounds().onSizeChanged { box = it }
+                    .pointerInput(path) {
+                        val decay = androidx.compose.animation.splineBasedDecay<Offset>(this)
+                        var anim: kotlinx.coroutines.Job? = null
+                        var lastTap = 0L
+                        var lastTapPos = Offset.Zero
+                        awaitEachGesture {
+                            val down = awaitFirstDown(requireUnconsumed = false)
+                            anim?.cancel()
+                            val vt = androidx.compose.ui.input.pointer.util.VelocityTracker()
+                            var multi = false
+                            var moved = 0f
+                            do {
+                                val ev = awaitPointerEvent()
+                                if (ev.changes.count { it.pressed } >= 2) multi = true
+                                val c = ev.calculateCentroid(useCurrent = true)
+                                if (c.isSpecified) {
+                                    val zoom = ev.calculateZoom()
+                                    val pan = ev.calculatePan()
+                                    moved += pan.getDistance()
+                                    val ns = (scale * zoom).coerceIn(1f, 6f)
+                                    val z = ns / scale
+                                    offX = clampX(c.x - z * (c.x - offX) + pan.x, ns)
+                                    offY = clampY(c.y - z * (c.y - offY) + pan.y, ns)
+                                    scale = ns
+                                    vt.addPosition(ev.changes[0].uptimeMillis, c)
                                 }
-                            }.getOrNull()
+                                ev.changes.forEach { if (it.positionChanged()) it.consume() }
+                            } while (ev.changes.any { it.pressed })
+                            val isTap = !multi && moved < viewConfiguration.touchSlop * 2
+                            if (isTap) {
+                                val now = System.currentTimeMillis()
+                                if (now - lastTap < 350 && (down.position - lastTapPos).getDistance() < 80f) {
+                                    lastTap = 0L
+                                    val target = if (scale > 1.2f) 1f else 2.5f
+                                    val p = down.position
+                                    anim = uiScope.launch {
+                                        androidx.compose.animation.core.Animatable(scale).animateTo(target) {
+                                            val ns = value
+                                            val z = ns / scale
+                                            offX = clampX(p.x - z * (p.x - offX), ns)
+                                            offY = clampY(p.y - z * (p.y - offY), ns)
+                                            scale = ns
+                                        }
+                                    }
+                                } else { lastTap = now; lastTapPos = down.position }
+                            } else if (!multi) {
+                                val v = vt.calculateVelocity()
+                                anim = uiScope.launch {
+                                    androidx.compose.animation.core.Animatable(Offset(offX, offY), Offset.VectorConverter)
+                                        .animateDecay(Offset(v.x, v.y), decay) {
+                                            offX = clampX(value.x, scale)
+                                            offY = clampY(value.y, scale)
+                                        }
+                                }
+                            }
                         }
                     }
+            ) {
+                drawRect(Color(0xFF444444))
+                val s = scale
+                for (i in sizes.indices) {
+                    val top = offY + tops[i] * s
+                    val h = heights[i] * s
+                    if (top > size.height || top + h < 0f) continue
+                    val w = docW * s
+                    val bmp = cache[i]
+                    if (bmp != null) drawImage(
+                        bmp.first,
+                        dstOffset = androidx.compose.ui.unit.IntOffset(offX.roundToInt(), top.roundToInt()),
+                        dstSize = IntSize(w.roundToInt(), h.roundToInt()),
+                        filterQuality = androidx.compose.ui.graphics.FilterQuality.Medium
+                    ) else drawRect(Color.White, Offset(offX, top), androidx.compose.ui.geometry.Size(w, h))
                 }
-                val shown = bmp
-                if (shown != null) Image(shown.asImageBitmap(), "Page ${index + 1}", Modifier.fillMaxWidth(), contentScale = ContentScale.FillWidth)
-                else Box(Modifier.fillMaxWidth().aspectRatio(0.7f).background(Color.White), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
             }
-        }
-        }
         }
     }
 }
